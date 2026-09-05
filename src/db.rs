@@ -664,10 +664,14 @@ impl Db {
         Ok(conn.query_row("SELECT country = '' FROM node WHERE id=?1", [id], |r| r.get(0))?)
     }
 
-    /// Records the country a lookup came back with. Set apart from the panel's
-    /// own writes: `update_node` never touches this column.
-    pub fn set_country(&self, id: i64, cc: &str) -> Result<()> {
-        self.conn().execute("UPDATE node SET country=?2 WHERE id=?1", params![id, cc])?;
+    /// Records the country a lookup came back with, unless the node has moved
+    /// to another address while the lookup was out. Same rule `save_facts`
+    /// writes into its `CASE`: the country belongs to the address it was asked
+    /// about, so a late answer about an address the node has left is not an
+    /// answer about the node. Set apart from the panel's own writes:
+    /// `update_node` never touches this column.
+    pub fn set_country(&self, id: i64, cc: &str, ip: &str) -> Result<()> {
+        self.conn().execute("UPDATE node SET country=?2 WHERE id=?1 AND ip=?3", params![id, cc, ip])?;
         Ok(())
     }
 
@@ -1604,11 +1608,17 @@ mod tests {
         let stored = || db.node(id).unwrap().unwrap().country;
 
         assert!(save("198.51.100.4"), "a node with no country is owed a lookup");
-        db.set_country(id, "US").unwrap();
+        db.set_country(id, "US", "198.51.100.4").unwrap();
         assert!(!save("198.51.100.4"), "the same address asks nothing a second time");
         assert_eq!(stored(), "US");
         assert!(save("203.0.113.9"), "a new address is a new question");
         assert_eq!(stored(), "", "and the answer to the old one is gone");
+
+        // A lookup that went out for the old address, landing after the move.
+        db.set_country(id, "US", "198.51.100.4").unwrap();
+        assert_eq!(stored(), "", "an answer about an address the node has left is dropped");
+        db.set_country(id, "JP", "203.0.113.9").unwrap();
+        assert_eq!(stored(), "JP", "the answer about the address it is at now lands");
     }
 
     #[test]

@@ -260,18 +260,22 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
     Ok(false)
 }
 
-/// Addresses already looked up, per node.
+/// When each node was last asked about.
 ///
 /// A failed lookup leaves the country column empty, so `save_facts` keeps
 /// answering "still owed"; without this an agent reconnecting every few
 /// seconds -- a bad link, or two machines on one token -- would spend one
-/// outbound request per reconnect, forever. The answer can only change when
-/// the address does, so that is what is remembered.
-static ASKED: OnceLock<Mutex<HashMap<i64, (String, Instant)>>> = OnceLock::new();
+/// outbound request per reconnect, forever. Keying on the address cannot hold
+/// the second of those: the two machines connect from different addresses, so
+/// each reconnect reads as a new question and the gate never closes. Only the
+/// clock is remembered. The cost is that a node which genuinely re-addresses
+/// within the hour waits for its next hello to get a badge, and an empty
+/// column is a state this already allows.
+static ASKED: OnceLock<Mutex<HashMap<i64, Instant>>> = OnceLock::new();
 const LOCATE_RETRY: Duration = Duration::from_secs(3_600);
 
-/// Resolves the address a node connects from to a country, once per address
-/// and at most once an hour while the lookup keeps failing.
+/// Resolves the address a node connects from to a country, at most once an
+/// hour per node.
 ///
 /// The answer is a third party's, and it ends up on the public page, so only
 /// two ASCII letters are ever stored. Anything else -- a private address
@@ -282,10 +286,10 @@ const LOCATE_RETRY: Duration = Duration::from_secs(3_600);
 /// process's. A hub restart asks again, which is once per node.
 fn locate(app: Shared, node_id: i64, ip: String) {
     let mut asked = ASKED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
-    if asked.get(&node_id).is_some_and(|(seen, at)| *seen == ip && at.elapsed() < LOCATE_RETRY) {
+    if asked.get(&node_id).is_some_and(|at| at.elapsed() < LOCATE_RETRY) {
         return;
     }
-    asked.insert(node_id, (ip.clone(), Instant::now()));
+    asked.insert(node_id, Instant::now());
     drop(asked);
 
     tokio::spawn(async move {
@@ -300,7 +304,7 @@ fn locate(app: Shared, node_id: i64, ip: String) {
         if cc.len() != 2 || !cc.bytes().all(|b| b.is_ascii_uppercase()) {
             return debug!("node {node_id}: {ip} resolved to no country");
         }
-        if let Err(e) = app.db.set_country(node_id, &cc) {
+        if let Err(e) = app.db.set_country(node_id, &cc, &ip) {
             warn!("node {node_id}: storing country {cc} failed: {e:#}");
         }
     });
