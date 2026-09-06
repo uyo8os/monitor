@@ -369,13 +369,26 @@ async fn github_login(app: &App, code: &str) -> Result<()> {
     Ok(())
 }
 
-/// Peer address, or the first hop in X-Forwarded-For when the request came
+/// Peer address, or the last hop in X-Forwarded-For when the request came
 /// through a local reverse proxy. Used for throttling and for the address shown
 /// next to a node, never for authorization.
 ///
 /// The header is honoured only when the peer is itself local. Otherwise a
 /// caller mints a fresh identity per request, walking past the lockout and
 /// growing the throttle map without bound.
+///
+/// The last value, not the first. Both proxies this project documents append
+/// rather than replace -- nginx's `$proxy_add_x_forwarded_for`, caddy's
+/// `reverse_proxy` default -- so a caller that sends an `X-Forwarded-For` of
+/// its own keeps that value at the head and the address the proxy actually saw
+/// lands at the tail. Reading the head handed the lockout straight back to the
+/// caller from behind a proxy, which is the one hole the local-peer test above
+/// exists to close: rotate the header and every attempt is a fresh address,
+/// write the operator's address and they are shut out of the sign-in page.
+///
+/// A second trusted proxy in front of the local one puts *its* address at the
+/// tail instead. No value in this header identifies the client on its own, so
+/// that deployment has to have its own edge write the client address.
 pub fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
     if !behind_local_proxy(peer) {
         return peer;
@@ -383,7 +396,7 @@ pub fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
     headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
+        .and_then(|v| v.rsplit(',').next())
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(peer)
 }
@@ -531,19 +544,30 @@ mod tests {
 
     #[test]
     fn forwarded_header_is_trusted_only_behind_a_local_proxy() {
-        let mut h = HeaderMap::new();
-        h.insert("x-forwarded-for", "198.51.100.9, 10.0.0.2".parse().unwrap());
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let xff = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("x-forwarded-for", v.parse().unwrap());
+            h
+        };
 
-        // A proxy on loopback or a private range: the header is the client.
-        assert_eq!(client_ip(&h, ip("127.0.0.1")).to_string(), "198.51.100.9");
-        assert_eq!(client_ip(&h, ip("10.0.0.1")).to_string(), "198.51.100.9");
-        assert_eq!(client_ip(&h, ip("::1")).to_string(), "198.51.100.9");
-        assert_eq!(client_ip(&h, ip("fd00::1")).to_string(), "198.51.100.9");
-        // Straight off the internet the header is whatever the caller typed,
-        // and honouring it walks past the lockout for free.
-        assert_eq!(client_ip(&h, ip("203.0.113.5")), ip("203.0.113.5"));
-        assert_eq!(client_ip(&h, ip("2001:db8::5")), ip("2001:db8::5"));
+        // Nothing came in with the request: the proxy appended the one address
+        // it saw, and that is the whole header.
+        assert_eq!(client_ip(&xff("198.51.100.9"), ip("127.0.0.1")).to_string(), "198.51.100.9");
+
+        // The caller sent a header of its own. Both documented proxies append,
+        // so the invention sits at the head and the proxy's own observation at
+        // the tail -- reading the head would let a caller pick its own throttle
+        // bucket every request, or name the operator's address and take theirs.
+        let forged = xff("10.0.0.2, 198.51.100.9");
+        for peer in ["127.0.0.1", "10.0.0.1", "::1", "fd00::1"] {
+            assert_eq!(client_ip(&forged, ip(peer)).to_string(), "198.51.100.9", "{peer}");
+        }
+
+        // Straight off the internet the whole header is whatever the caller
+        // typed, and honouring any part of it walks past the lockout for free.
+        assert_eq!(client_ip(&forged, ip("203.0.113.5")), ip("203.0.113.5"));
+        assert_eq!(client_ip(&forged, ip("2001:db8::5")), ip("2001:db8::5"));
         // No header at all: the peer, wherever it is.
         assert_eq!(client_ip(&HeaderMap::new(), ip("10.0.0.1")), ip("10.0.0.1"));
     }
