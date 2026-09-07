@@ -775,6 +775,7 @@ mod tests {
             .db
             .ping_records(id, 0, 60)
             .unwrap()
+            .0
             .iter()
             .map(|r| (r["task_id"].as_i64().unwrap(), r["latency"].as_i64().unwrap()))
             .collect();

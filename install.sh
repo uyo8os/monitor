@@ -73,9 +73,20 @@ case "$HOST" in
 "["*) HOST="${HOST#\[}"; HOST="${HOST%%]*}" ;;
 *) HOST="${HOST%%:*}" ;;
 esac
+# A full dotted quad in 127/8, and nothing shorter -- which is what the agent's
+# own is_loopback() accepts, because Rust's IpAddr parser takes nothing shorter
+# either. `127.1` is a name to it, not an address. The two halves have to agree
+# or this installs over plaintext against a hub the agent then refuses to dial:
+# the unit is written, the service is started, and it crash-loops on RestartSec
+# forever with this script having printed "installed".
+#
+# First arm out: anything holding a letter is a registered name however it
+# starts (`127.evil.com` resolves wherever its owner points it), and more than
+# four components is not an address at all.
 case "$HOST" in
-127.*[!0-9.]*) LOCAL="" ;; # a name that merely starts 127.
-127.* | localhost | ::1) LOCAL=1 ;;
+localhost | ::1) LOCAL=1 ;;
+*[!0-9.]* | *.*.*.*.*) LOCAL="" ;;
+127.[0-9]*.[0-9]*.[0-9]*) LOCAL=1 ;;
 *) LOCAL="" ;;
 esac
 case "$SERVER" in

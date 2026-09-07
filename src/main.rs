@@ -322,6 +322,24 @@ async fn main() -> Result<()> {
             args.listen.port()
         );
     }
+    // Checked once, here, because it is a static answer: `provisioning_allowed`
+    // measures every request against --site, so a value that is not an https
+    // domain entry refuses adding and installing nodes for good, however
+    // correctly the panel is reached. That refusal names the browser's address
+    // and the reverse proxy, which are both fine in this case -- and the debug
+    // line that does name --site is off at the default log level, so nothing
+    // anywhere said which of the three it was. Warned rather than fatal: the
+    // hub still serves everything else, and an operator upgrading into this
+    // check should not lose a running hub to it. `install-hub.sh` refuses the
+    // same shapes where the value is typed.
+    if !args.site.is_empty() && api::https_domain(&args.site).is_none() {
+        warn!(
+            "--site {} is not an https domain entry, so adding and installing nodes will be refused \
+             however the panel is reached: it has to be https://, a domain rather than an address, \
+             and nothing after the host",
+            args.site
+        );
+    }
 
     tokio::spawn(housekeeping(app.clone()));
 

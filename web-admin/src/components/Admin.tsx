@@ -891,7 +891,12 @@ function Ping({ nodes }: { nodes: Node[] }) {
                   <Input autoFocus={!editing.id} value={editing.name ?? ""} onChange={(e) => setEditing({ ...editing, name: e.target.value })} placeholder="Cloudflare" />
                 </Field>
                 <Field label="间隔（秒）" hint="5–3600">
-                  <Input type="number" min="5" max="3600" value={editing.interval ?? 60} onChange={(e) => setEditing({ ...editing, interval: Number(e.target.value) })} />
+                  {/* `|| 60`, as the three other number boxes on this page do:
+                      an emptied `type="number"` reads back as "", and Number("")
+                      is 0 -- which the hub used to clamp into a 5-second probe on
+                      every assigned node. It refuses that now, so this keeps a
+                      cleared box from being a round trip to an error. */}
+                  <Input type="number" min="5" max="3600" value={editing.interval ?? 60} onChange={(e) => setEditing({ ...editing, interval: Number(e.target.value) || 60 })} />
                 </Field>
               </div>
               <Field label="目标地址" hint="host:port">

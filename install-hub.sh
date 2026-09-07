@@ -171,7 +171,7 @@ install_hub() {
 	# Verified against the release's own checksum file, so a truncated transfer
 	# or a swapped asset is caught before anything lands in /opt/monitor.
 	curl -fsSL --max-time 30 "$base/sha256sums.txt" -o "$tmp/sums" ||
-		die "校验文件下载失败；这个版本可能早于 sha256sums.txt，请改用手动安装"
+		die "校验文件下载失败"
 	want="$(sed -n "s/^\([0-9a-f]\{64\}\)  *$asset\$/\1/p" "$tmp/sums")"
 	[ -n "$want" ] || die "sha256sums.txt 里没有 $asset 这一项"
 	got="$(sha256sum "$tmp/$asset" | cut -d' ' -f1)"
@@ -396,7 +396,31 @@ while [ $# -gt 0 ]; do
 done
 
 check_port "$PORT"
-case "$SITE" in "" | http://* | https://*) ;; *) die "--site 要以 http:// 或 https:// 开头" ;; esac
+# The same shape `api::https_domain` measures --site against on the hub, checked
+# here because this is where the value is typed. A hub started with one it
+# refuses comes up fine and then declines to add or install a single node, while
+# the message the panel prints names the browser and the reverse proxy -- both
+# of which are innocent. Failing at the prompt costs one line; finding it later
+# costs an afternoon.
+SITE="${SITE%/}"
+if [ -n "$SITE" ]; then
+	case "$SITE" in
+	https://*) ;;
+	*) die "--site 必须以 https:// 开头：$SITE" ;;
+	esac
+	rest="${SITE#https://}"
+	case "$rest" in
+	*/*) die "--site 后面不能带路径，只要 https://域名[:端口]：$SITE" ;;
+	*@*) die "--site 里不能带用户名：$SITE" ;;
+	"["*) die "--site 必须是域名，不能是 IP 地址：$SITE" ;;
+	esac
+	# Port is allowed; what follows has to be a name rather than an address.
+	case "${rest%%:*}" in
+	"" | localhost | *.localhost) die "--site 必须是一个域名：$SITE" ;;
+	*[!0-9.]*) ;;
+	*) die "--site 必须是域名而不是 IP 地址：$SITE" ;;
+	esac
+fi
 [ "$(id -u)" = 0 ] || die "需要 root：sudo sh $0"
 command -v curl >/dev/null 2>&1 || die "需要 curl"
 command -v sha256sum >/dev/null 2>&1 || die "需要 sha256sum（装 coreutils）"

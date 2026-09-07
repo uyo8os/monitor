@@ -200,9 +200,17 @@ pub async fn metrics(
     let probes =
         if wants("ping") { app.db.ping_task_names(id).unwrap_or_else(|_| json!({})) } else { json!({}) };
     let metrics = if wants("metrics") { app.db.metrics(id, since, step) } else { Ok(vec![]) };
-    let ping = if wants("ping") { app.db.ping_records(id, since, step) } else { Ok(vec![]) };
+    let ping = if wants("ping") { app.db.ping_records(id, since, step) } else { Ok((vec![], json!({}))) };
     match (metrics, ping) {
-        (Ok(m), Ok(p)) => Json(json!({"metrics": m, "ping": p, "probes": probes})).into_response(),
+        // `loss` is per probe across the whole window, beside the per-bucket
+        // `loss` on the rows. Both are needed and neither replaces the other:
+        // the row figure is what a tooltip reads, and the window figure is the
+        // only one that can be right, because the denominators it divides by
+        // are gone by the time the rows are built. Additive, so a theme that
+        // has never heard of it keeps working.
+        (Ok(m), Ok((p, loss))) => {
+            Json(json!({"metrics": m, "ping": p, "probes": probes, "loss": loss})).into_response()
+        }
         (Err(e), _) | (_, Err(e)) => fail(e),
     }
 }
@@ -351,14 +359,19 @@ async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>
 
 // ---- panel write paths ----
 
-/// Names the second cause as well as the first. A reverse proxy that does not
-/// preserve Host forwards its own upstream address, which is an IP and so
-/// never an https domain entry -- and the admin reading this is already on the
-/// domain, so the first half alone sends them looking in the wrong place.
+/// Names all three causes. A reverse proxy that does not preserve Host forwards
+/// its own upstream address, which is an IP and so never an https domain entry
+/// -- and the admin reading this is already on the domain, so the first clause
+/// alone sends them looking in the wrong place. The third is `--site`, which is
+/// the one input to this answer that nothing about the request can show: a hub
+/// started with `--site https://198.51.100.7` refuses every provisioning call
+/// from a perfectly good https domain entry. `main` warns about that at
+/// startup; this is for whoever is reading the panel rather than the journal.
 const PROVISIONING_DENIED: &str = "请通过 HTTPS 域名访问面板后添加或安装节点；\
-     如果已经是域名访问，检查反向代理是否透传了 Host 与 X-Forwarded-Proto（见 README 的反代配置）";
+     如果已经是域名访问，检查反向代理是否透传了 Host 与 X-Forwarded-Proto（见 README 的反代配置）；\
+     两者都没问题就检查 hub 的启动参数 --site，它必须是 https:// 加域名，不能是 IP、不能带路径";
 
-fn https_domain(site: &str) -> Option<reqwest::Url> {
+pub(crate) fn https_domain(site: &str) -> Option<reqwest::Url> {
     let url = reqwest::Url::parse(site).ok()?;
     (url.scheme() == "https"
         && url.domain().is_some_and(|d| d != "localhost" && !d.ends_with(".localhost"))
@@ -737,7 +750,16 @@ pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task):
     if !valid_target(&task.target) {
         return bad("target must be host:port, for example 1.1.1.1:443 or [2606:4700:4700::1111]:443");
     }
-    task.interval = task.interval.clamp(5, 3_600);
+    // Refused rather than clamped, for the reason `setting_error` already gives
+    // for `retention_days`: the agent clamps this again on the way in, so an
+    // out-of-range value never fails -- it quietly becomes a different number
+    // while the panel's box still shows what was typed. Below the floor that
+    // number is 5 seconds, the fastest probe there is, run by every node the
+    // task is assigned to; the panel reaches 0 by having its interval box
+    // cleared, which is a keystroke rather than an attack.
+    if !(5..=3_600).contains(&task.interval) {
+        return bad("interval must be from 5 to 3600 seconds");
+    }
     match app.db.save_ping_task(&task) {
         Ok(id) => {
             agent_ws::push_ping_tasks(&app);
@@ -961,10 +983,11 @@ pub async fn db_restore(
     body: axum::body::Body,
 ) -> Response {
     // One fixed path, which is what lets the file's own length be the entire
-    // protocol. Two admins uploading at once collide on the offset check
-    // instead of interleaving into one file.
-    // ponytail: one upload in flight per hub. A second slot would need ids and
-    // a way to expire them, for a button one person presses once a year.
+    // protocol.
+    // ponytail: one upload in flight per hub. Two started at once still land on
+    // this one name, and equal-sized chunks make their offsets line up, so they
+    // splice instead of colliding -- the cost is a failed upload, and telling
+    // them apart needs the upload id the protocol deliberately does not have.
     let path = format!("{}.upload", app.db.file());
     let received = match receive(&path, &chunk, MAX_RESTORE, body).await {
         Ok(received) => received,
@@ -974,12 +997,26 @@ pub async fn db_restore(
         return Json(json!({"received": received})).into_response();
     }
 
-    let outcome = restore(&app, &path).await;
+    // Moved off the upload name before a byte of it is read. Splicing costs an
+    // upload; what it must not cost is the live database, and without this it
+    // could: the other upload goes on appending through its own handle while
+    // `check_backup` reads the file and the page copy follows, and SQLite
+    // cannot see a write it did not make. A file that passed every gate would
+    // then be copied over in some other state. Afterwards the other upload's
+    // next chunk finds nothing and is told to start again, which is the error
+    // it already had for an upload that went away.
+    let source = scratch_path(&app, "restoring");
+    if let Err(e) = std::fs::rename(&path, &source) {
+        let _ = std::fs::remove_file(&path);
+        return bad(&format!("上传收齐了却取不到文件：{e}"));
+    }
+
+    let outcome = restore(&app, &source).await;
     // SQLite writes a -wal and a -shm beside any file it opens in WAL mode,
     // and a plain copy of a running hub's database is exactly that. They go
     // when the connection closes cleanly; these three lines are what covers
     // the time it does not.
-    for leftover in [path.clone(), format!("{path}-wal"), format!("{path}-shm")] {
+    for leftover in [source.clone(), format!("{source}-wal"), format!("{source}-shm")] {
         let _ = std::fs::remove_file(leftover);
     }
     match outcome {
@@ -1055,15 +1092,26 @@ pub async fn upload_theme(
         return Json(json!({"received": received})).into_response();
     }
 
+    // Moved off the shared upload name for the same reason as the restore
+    // path: a second upload landing on it can go on writing while this archive
+    // is being read, and the unpacker would be reading a file that changed
+    // under it. Named so `valid_short` still rejects it, keeping a half-written
+    // archive out of the theme list.
+    let source = app.themes.join(format!(".installing-{}.tar.gz", &random_token()[..16]));
+    if let Err(e) = std::fs::rename(&path, &source) {
+        let _ = std::fs::remove_file(&path);
+        return bad(&format!("上传收齐了却取不到文件：{e}"));
+    }
+
     // Off the runtime: gunzip plus a few thousand small writes.
     let installed = {
-        let (app, path) = (app.clone(), path.clone());
+        let (app, path) = (app.clone(), source.clone());
         tokio::task::spawn_blocking(move || {
             crate::frontend::install(&app.themes, std::fs::File::open(&path)?, None)
         })
         .await
     };
-    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&source);
     match installed.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
         Ok(theme) => Json(json!({"theme": theme})).into_response(),
         Err(e) => bad(&format!("{e:#}")),
@@ -1483,6 +1531,37 @@ mod tests {
         assert_eq!(app.db.ping_tasks().unwrap().len(), 1);
     }
 
+    /// The same rule `retention_days` holds, on the other number this hub
+    /// clamps downstream: a value out of range has to fail, or it silently
+    /// becomes a different one. Below the floor that one is 5 seconds -- the
+    /// fastest probe there is -- and the panel reaches 0 by having its interval
+    /// box cleared, since `Number("")` is 0.
+    #[tokio::test]
+    async fn a_probe_interval_out_of_range_is_refused_rather_than_clamped() {
+        let app = std::sync::Arc::new(app());
+        let save = |interval| {
+            let task = PingTask {
+                id: 0,
+                name: "probe".into(),
+                target: "1.1.1.1:443".into(),
+                interval,
+                nodes: vec![],
+            };
+            save_ping_task(Admin, State(app.clone()), Json(task))
+        };
+        for refused in [0, -1, 4, 3_601, i64::MAX] {
+            assert_eq!(save(refused).await.status(), StatusCode::BAD_REQUEST, "{refused}");
+        }
+        assert!(app.db.ping_tasks().unwrap().is_empty(), "a refused interval must not store a probe");
+
+        // Both ends of the range still save, and store what was sent.
+        for ok in [5, 60, 3_600] {
+            assert_eq!(save(ok).await.status(), StatusCode::OK, "{ok}");
+        }
+        let stored: Vec<i64> = app.db.ping_tasks().unwrap().iter().map(|t| t.interval).collect();
+        assert_eq!(stored, vec![5, 60, 3_600]);
+    }
+
     /// The update button follows a manifest's `url` to build a download
     /// address, so what counts as a GitHub repository is the whole of the
     /// trust boundary: whatever this accepts, the hub will fetch.
@@ -1616,7 +1695,7 @@ mod tests {
             let step = sample_step(hours, None);
             let since = now - hours * 3_600;
             let metrics = app.db.metrics(id, since, step).unwrap();
-            let ping = app.db.ping_records(id, since, step).unwrap();
+            let (ping, _) = app.db.ping_records(id, since, step).unwrap();
             // Against the budget itself, not against whatever the step worked
             // out to: derived from the step, this would only say that division
             // works. One bucket of slack, as the window rarely divides evenly.
@@ -1690,7 +1769,7 @@ mod tests {
 
         // By task, not by index: the rows share a timestamp, so `ORDER BY ts`
         // leaves their order to SQLite.
-        let rows = app.db.ping_records(id, base, 120).unwrap();
+        let (rows, window_loss) = app.db.ping_records(id, base, 120).unwrap();
         let probe = |task: i64| {
             rows.iter().find(|r| r["task_id"] == task).unwrap_or_else(|| panic!("no probe {task}"))
         };
@@ -1704,6 +1783,11 @@ mod tests {
         // percentage rounds up: the key's absence reads as "nothing was lost",
         // so nothing lost has to be the only way to produce it.
         assert!(probe(3).get("loss").is_none(), "{:?}", probe(3));
+        // Each probe has one bucket here, so the window figure and the bucket
+        // figure agree -- which is exactly the fixture shape that hid the
+        // difference between them. The test below is the one that separates.
+        assert_eq!(window_loss["2"], 100.0);
+        assert!(window_loss.get("3").is_none(), "a probe that lost nothing is left out");
 
         // One timeout in a bucket too full for it to be a whole percent:
         // truncating answers the same as a clean bucket.
@@ -1713,7 +1797,7 @@ mod tests {
         for i in 0..180 {
             app.db.insert_ping(wide, wide_probe, wide_base + i, if i == 0 { -1 } else { 20 }).unwrap();
         }
-        let rows = app.db.ping_records(wide, wide_base, 180).unwrap();
+        let (rows, _) = app.db.ping_records(wide, wide_base, 180).unwrap();
         assert_eq!(rows.len(), 1, "the fixture has to be one bucket for this to mean anything");
         let row = &rows[0];
         assert_eq!(row["loss"], 1, "a bucket that lost one of 180 has not lost none");
@@ -1725,7 +1809,7 @@ mod tests {
         for (i, latency) in [10, 20, 50, 20, 20].into_iter().enumerate() {
             app.db.insert_ping(jitter, jitter_probe, wide_base + i as i64, latency).unwrap();
         }
-        let row = &app.db.ping_records(jitter, wide_base, 180).unwrap()[0];
+        let row = &app.db.ping_records(jitter, wide_base, 180).unwrap().0[0];
         assert_eq!(row["latency"], 20, "the middle answer, not the mean of 24");
         assert_eq!(row["band"], json!([10, 50]));
 
@@ -1737,7 +1821,38 @@ mod tests {
         for (i, latency) in [40, 10, 30, 20].into_iter().enumerate() {
             app.db.insert_ping(even, even_probe, wide_base + i as i64, latency).unwrap();
         }
-        assert_eq!(app.db.ping_records(even, wide_base, 180).unwrap()[0]["latency"], 25);
+        assert_eq!(app.db.ping_records(even, wide_base, 180).unwrap().0[0]["latency"], 25);
+    }
+
+    /// What a window lost is the share of its samples that were lost, and the
+    /// hub is the only party that can say: `close_bucket` divides inside each
+    /// bucket and keeps the quotient, so the denominators are gone by the time
+    /// a reader sees the rows. Averaging the bucket percentages weights a
+    /// bucket holding one sample the same as one holding twelve -- and buckets
+    /// of unequal size are the ordinary case, not an edge one. The window's
+    /// first and last are partial by construction; a probe that starts, stops,
+    /// loses its node or skips a round on a slow resolver makes more.
+    #[test]
+    fn a_probe_reports_the_share_of_the_window_it_lost_not_the_mean_of_its_buckets() {
+        let app = app();
+        let id = node(&app, "n", true);
+        let probe = task(&app, vec![id]);
+        let base = Utc::now().timestamp() / 60 * 60 - 120;
+        // A full minute at five seconds a round that lost nothing, then a
+        // minute holding one sample, which was lost, before the probe stopped.
+        for i in 0..12 {
+            app.db.insert_ping(id, probe, base + i * 5, 20).unwrap();
+        }
+        app.db.insert_ping(id, probe, base + 60, -1).unwrap();
+
+        let (rows, loss) = app.db.ping_records(id, base, 60).unwrap();
+        let per_bucket: Vec<i64> = rows.iter().map(|r| r["loss"].as_i64().unwrap_or(0)).collect();
+        assert_eq!(per_bucket, vec![0, 100], "the buckets are right about themselves");
+
+        // Their mean is 50%. One round of thirteen did not answer.
+        let window = loss.get(probe.to_string()).and_then(|v| v.as_f64()).expect("this probe lost one");
+        assert!((window - 100.0 / 13.0).abs() < 1e-9, "{window}");
+        assert!(window < 8.0, "the window lost {window}%, not the 50% its buckets average to");
     }
 
     #[test]

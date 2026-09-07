@@ -144,6 +144,14 @@ fn schema_mentions(conn: &Connection, table: &str, needle: &str) -> Result<bool>
     )? > 0)
 }
 
+/// One table's column names. `table` is always a [`TABLES`] entry, never
+/// anything a caller chose, which is why it can be formatted into the pragma.
+fn columns_of(conn: &Connection, table: &str) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    Ok(names.collect::<Result<_, _>>()?)
+}
+
 /// Everything that had accumulated before there was a version to record it
 /// under. Runs once, on a database that predates the stamp.
 fn migrate_to_1(conn: &Connection) -> Result<()> {
@@ -1045,9 +1053,28 @@ impl Db {
         Ok(serde_json::Value::Object(names))
     }
 
+    /// Files one probe result, and only under a probe this node is actually
+    /// assigned. A result for anything else is dropped, not an error: the agent
+    /// has nothing useful to do about it either way.
+    ///
+    /// The assignment is tested inside the statement because that is the only
+    /// place it is atomic with the write -- `ping_record` carries no foreign key
+    /// to lean on, being WITHOUT ROWID and keyed for the chart query. Two things
+    /// arrive here without one. A result already in flight when the panel
+    /// deleted its probe, which would otherwise land after `delete_ping_task`
+    /// swept the history and be inherited by whichever probe SQLite hands the
+    /// id to next. And a node token in the wrong hands: every other write an
+    /// agent can cause is bounded -- one `metric` row per node per minute, one
+    /// `traffic` row per node -- while `task_id` is chosen by the reporter, so
+    /// without this it is the one write whose row count nothing caps.
+    ///
+    /// The chart's own `task_id IN (assignments)` filter hides both afterwards.
+    /// It does not stop the write, the storage it takes, or the id being reused.
     pub fn insert_ping(&self, node_id: i64, task_id: i64, ts: i64, latency: i64) -> Result<()> {
         self.conn().execute(
-            "INSERT OR REPLACE INTO ping_record (node_id, task_id, ts, latency) VALUES (?1,?2,?3,?4)",
+            "INSERT OR REPLACE INTO ping_record (node_id, task_id, ts, latency)
+             SELECT ?1, ?2, ?3, ?4
+             WHERE EXISTS (SELECT 1 FROM ping_node WHERE task_id = ?2 AND node_id = ?1)",
             params![node_id, task_id, ts, latency],
         )?;
         Ok(())
@@ -1064,7 +1091,23 @@ impl Db {
     /// [`PING_ROWS`] answers in time order, so a bucket is finished the moment
     /// the next one opens and only that one is ever held -- at most the probes
     /// assigned to the node times the results one bucket spans.
-    pub fn ping_records(&self, node_id: i64, since: i64, step: i64) -> Result<Vec<serde_json::Value>> {
+    ///
+    /// Answers with the buckets and, beside them, the share of the whole window
+    /// each probe lost. That second figure cannot be recovered from the first:
+    /// [`close_bucket`] divides inside each bucket and keeps only the quotient,
+    /// so a reader averaging those percentages weights a bucket holding one
+    /// sample the same as one holding twelve. The buckets are not equal and
+    /// cannot be -- the window's first and last are partial by construction,
+    /// and a probe that starts, stops, loses its node or has a round skipped
+    /// makes more. The denominators exist only here, in the pass that already
+    /// reads every row, so this is the only place the answer is available at
+    /// all. Probes that lost nothing are left out, as `loss` is on a bucket.
+    pub fn ping_records(
+        &self,
+        node_id: i64,
+        since: i64,
+        step: i64,
+    ) -> Result<(Vec<serde_json::Value>, serde_json::Value)> {
         let conn = self.conn();
         let mut stmt = conn.prepare_cached(PING_ROWS)?;
         let mut rows = stmt.query(params![node_id, since, step])?;
@@ -1072,6 +1115,10 @@ impl Db {
         // Per probe in the bucket being filled: what answered, and how many
         // did not.
         let mut open: Vec<(i64, Vec<i64>, i64)> = Vec::new();
+        // Per probe across the whole window: how many were lost, and of how
+        // many. Folded in the same pass rather than asked of SQLite a second
+        // time, for the reason the bucket fold itself is in Rust.
+        let mut totals: HashMap<i64, (i64, i64)> = HashMap::new();
         let mut bucket = 0;
         while let Some(row) = rows.next()? {
             let (b, task, latency) = (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?);
@@ -1079,6 +1126,8 @@ impl Db {
                 close_bucket(&mut out, &mut open, bucket * step);
                 bucket = b;
             }
+            let seen = totals.entry(task).or_insert((0, 0));
+            seen.1 += 1;
             let probe = match open.iter().position(|(id, ..)| *id == task) {
                 Some(at) => &mut open[at],
                 None => {
@@ -1090,12 +1139,22 @@ impl Db {
             // instead.
             if latency < 0 {
                 probe.2 += 1;
+                seen.0 += 1;
             } else {
                 probe.1.push(latency);
             }
         }
         close_bucket(&mut out, &mut open, bucket * step);
-        Ok(out)
+        // Unrounded: the caller decides how to print it, and rounding here
+        // would turn 0.14% into the 0% that means "lost nothing".
+        let loss: serde_json::Map<String, serde_json::Value> = totals
+            .into_iter()
+            .filter(|(_, (lost, _))| *lost > 0)
+            .map(|(task, (lost, samples))| {
+                (task.to_string(), serde_json::json!(100.0 * lost as f64 / samples as f64))
+            })
+            .collect();
+        Ok((out, serde_json::Value::Object(loss)))
     }
 
     // ---- the database file itself ----
@@ -1203,6 +1262,11 @@ impl Db {
     /// What a file has to be before a single page of it is copied over the
     /// live database. Restore is the one button here that destroys data, and
     /// the file behind it came from a disk this hub knows nothing about.
+    ///
+    /// **Writes to `src`.** The migrations an older backup needs run here, on
+    /// the upload, rather than after it has been copied: everything that can
+    /// fail then fails while the live database is still untouched. The caller
+    /// owns that file and deletes it either way.
     pub fn check_backup(&self, src: &str) -> Result<()> {
         // Read-write, not read-only: a plain copy of a running hub's database
         // is in WAL mode, and SQLite cannot open one of those read-only
@@ -1249,6 +1313,39 @@ impl Db {
         if theirs != ours {
             anyhow::bail!("the backup uses a {theirs}-byte page, this database uses {ours}");
         }
+        // Brought up to this build's schema here, on the upload. It used to run
+        // after the copy, where a migration that failed left the hub on a
+        // database it could not use and answered the panel with a failure --
+        // the one arrangement in which "restore failed" and "your data is gone"
+        // are both true.
+        migrate(&candidate, version)?;
+        // The migration lands in a -wal beside a backup taken from a running
+        // hub. Folded in here so the copy below reads one file, whatever
+        // reopening it would have done.
+        let _ = candidate.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+
+        // Table names are not a schema. Pages are copied verbatim, so the
+        // columns the file carries are the ones this hub's statements then run
+        // against, and eight tables of the right names holding the wrong
+        // columns cleared every gate above while leaving the database unusable.
+        //
+        // Compared against a database this build creates for itself, so there
+        // is no second column list to keep in step with `SCHEMA`. Names as
+        // sets, not the stored DDL: a migrated old backup reaches the same
+        // columns through `ALTER TABLE` and its text will never match a fresh
+        // `CREATE TABLE`. Extra columns are somebody else's business.
+        let reference = Connection::open_in_memory()?;
+        reference.execute_batch(SCHEMA)?;
+        migrate(&reference, SCHEMA_VERSION)?;
+        for table in TABLES {
+            let want = columns_of(&reference, table)?;
+            let got = columns_of(&candidate, table)?;
+            let mut missing: Vec<&str> = want.difference(&got).map(String::as_str).collect();
+            if !missing.is_empty() {
+                missing.sort_unstable();
+                anyhow::bail!("the file's {table} table is missing {}", missing.join(", "));
+            }
+        }
         Ok(())
     }
 
@@ -1257,13 +1354,13 @@ impl Db {
     /// permissions and its journal mode, and a failure part way through rolls
     /// back rather than leaving half a database behind.
     ///
-    /// Call [`Db::check_backup`] first. Like the other two, this reads and
-    /// writes the whole file, so it belongs off the runtime.
+    /// Call [`Db::check_backup`] first -- it is what leaves `src` on this
+    /// build's schema, so the copy is the last step and nothing after it can
+    /// fail. Like the other two, this reads and writes the whole file, so it
+    /// belongs off the runtime.
     pub fn restore_from(&self, src: &str) -> Result<()> {
         let mut conn = self.conn();
         conn.restore(rusqlite::MAIN_DB, src, None::<fn(rusqlite::backup::Progress)>)?;
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        migrate(&conn, version)?;
         Ok(())
     }
 
@@ -1529,6 +1626,24 @@ mod tests {
             .unwrap();
         assert!(db.check_backup(&bad).is_err(), "a view where a table belongs");
 
+        // Eight tables with the right names and none of the right columns.
+        // Every gate above passes: it is a healthy SQLite file, it carries no
+        // view or trigger, all eight names are there, it stamps itself with
+        // this build's version and uses the same page size. Restoring copies
+        // pages, so those columns would be the ones the hub then runs every
+        // statement against -- and it did, answering the panel "restore
+        // failed" over a database that was already gone.
+        let _ = std::fs::remove_file(&bad);
+        let shaped = Connection::open(&bad).unwrap();
+        for table in TABLES {
+            shaped.execute_batch(&format!("CREATE TABLE {table} (x TEXT)")).unwrap();
+        }
+        shaped.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}")).unwrap();
+        // Which table trips first follows the order of TABLES and is not the
+        // point; naming the table and the columns is.
+        let refused = db.check_backup(&bad).unwrap_err().to_string();
+        assert!(refused.contains("table is missing"), "{refused}");
+
         // From a hub that knows a schema this build has never seen.
         let _ = std::fs::remove_file(&bad);
         let newer = Connection::open(&bad).unwrap();
@@ -1555,8 +1670,18 @@ mod tests {
         db.insert_metric(id, now - 3 * 86_400, &serde_json::json!({"cpu": 1.0})).unwrap();
         assert_eq!(db.stats().unwrap()["oldest"], now - 3 * 86_400);
 
-        // Older, and in the other table: the earlier of the two wins.
-        db.insert_ping(id, 1, now - 9 * 86_400, 12).unwrap();
+        // Older, and in the other table: the earlier of the two wins. The probe
+        // has to be assigned, or the result is not this node's to file.
+        let task = db
+            .save_ping_task(&PingTask {
+                id: 0,
+                name: "p".into(),
+                target: "1.1.1.1:443".into(),
+                interval: 60,
+                nodes: vec![id],
+            })
+            .unwrap();
+        db.insert_ping(id, task, now - 9 * 86_400, 12).unwrap();
         assert_eq!(db.stats().unwrap()["oldest"], now - 9 * 86_400);
 
         db.set("retention_days", "9999").unwrap();
@@ -1785,7 +1910,7 @@ mod tests {
         let fresh = node(&db, 1);
         assert_eq!(fresh, id, "the id is reused, which is what makes this reachable");
         db.save_ping_task(&PingTask { id: task, nodes: vec![fresh], ..probe(vec![]) }).unwrap();
-        assert!(db.ping_records(fresh, 0, 60).unwrap().is_empty(), "and it starts with no history");
+        assert!(db.ping_records(fresh, 0, 60).unwrap().0.is_empty(), "and it starts with no history");
     }
 
     /// The mirror of the sweep above, on the other key of the same table.
@@ -1809,7 +1934,47 @@ mod tests {
 
         let fresh = db.save_ping_task(&probe("singapore")).unwrap();
         assert_eq!(fresh, old, "the id is reused, which is what makes this reachable");
-        assert!(db.ping_records(id, 0, 60).unwrap().is_empty(), "and it starts with no history");
+        assert!(db.ping_records(id, 0, 60).unwrap().0.is_empty(), "and it starts with no history");
+    }
+
+    /// Counted straight off the table, not read back through `ping_records`:
+    /// that query filters on the node's assignments, so a row written under a
+    /// probe it does not have is invisible to it. An assertion made through it
+    /// therefore cannot fail for the write this test exists to stop -- which is
+    /// how a result carrying any positive id at all went on being stored.
+    #[test]
+    fn a_result_for_a_probe_this_node_does_not_have_is_not_stored() {
+        let db = db();
+        let mine = node(&db, 1);
+        let other = node(&db, 1);
+        let rows = || db.conn().query_row("SELECT COUNT(*) FROM ping_record", [], |r| r.get::<_, i64>(0));
+        let task = db
+            .save_ping_task(&PingTask {
+                id: 0,
+                name: "p".into(),
+                target: "1.1.1.1:443".into(),
+                interval: 60,
+                nodes: vec![mine],
+            })
+            .unwrap();
+
+        db.insert_ping(mine, task, 1, 42).unwrap();
+        assert_eq!(rows().unwrap(), 1, "the node the probe is assigned to files its own result");
+
+        // A probe that exists but belongs to another node, and ids that name no
+        // probe at all -- what a node token can put on the wire.
+        db.insert_ping(other, task, 1, 42).unwrap();
+        for invented in [7, 999_999, i64::from(i32::MAX) + 1] {
+            db.insert_ping(mine, invented, 1, 42).unwrap();
+        }
+        assert_eq!(rows().unwrap(), 1, "nothing else reaches the table");
+
+        // Deleting the probe ends its node's results too, so one already in
+        // flight cannot land after the sweep and be inherited by the next probe
+        // to take the id.
+        db.delete_ping_task(task).unwrap();
+        db.insert_ping(mine, task, 2, 42).unwrap();
+        assert_eq!(rows().unwrap(), 0, "a late result for a deleted probe is dropped");
     }
 
     /// The strings in a `hello` come off a machine nobody has vouched for, and
@@ -2066,15 +2231,15 @@ mod tests {
         };
         let task = probe(vec![id], 0);
         db.insert_ping(id, task, 100, 42).unwrap();
-        assert_eq!(db.ping_records(id, 0, 60).unwrap().len(), 1, "an assigned probe draws");
+        assert_eq!(db.ping_records(id, 0, 60).unwrap().0.len(), 1, "an assigned probe draws");
 
         probe(vec![], task);
-        assert!(db.ping_records(id, 0, 60).unwrap().is_empty(), "an unassigned one does not");
+        assert!(db.ping_records(id, 0, 60).unwrap().0.is_empty(), "an unassigned one does not");
 
         // The rows are still there: reassigning brings the history back rather
         // than starting over.
         probe(vec![id], task);
-        assert_eq!(db.ping_records(id, 0, 60).unwrap().len(), 1, "and it comes back with its history");
+        assert_eq!(db.ping_records(id, 0, 60).unwrap().0.len(), 1, "and it comes back with its history");
 
         // The names ride along with those samples, so they follow the same
         // filter: a probe name is the operator's own words and routinely
