@@ -1005,6 +1005,13 @@ pub async fn db_restore(
     // then be copied over in some other state. Afterwards the other upload's
     // next chunk finds nothing and is told to start again, which is the error
     // it already had for an upload that went away.
+    //
+    // ponytail: nothing pins the rename itself. What it changes is which path
+    // is open *during* the read, and reaching that needs a second upload
+    // landing inside the copy -- machinery that would only ever prove itself.
+    // What is testable afterwards is that neither name is left behind, and
+    // `a_finished_restore_leaves_no_scratch_file_behind` holds that; the rename
+    // is three lines and reads as what it is.
     let source = scratch_path(&app, "restoring");
     if let Err(e) = std::fs::rename(&path, &source) {
         let _ = std::fs::remove_file(&path);
@@ -1629,6 +1636,49 @@ mod tests {
         assert_eq!(receive(path, &piece(0, 2), 1024, body(b"hi")).await.unwrap(), 2);
         assert_eq!(std::fs::read(path).unwrap(), b"hi");
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// Both scratch names a restore uses sit beside the live database, and one
+    /// left behind is what the next upload trips over -- `receive` refuses a
+    /// first chunk that does not line up with a file already there.
+    ///
+    /// This does not pin the rename in `db_restore`; nothing here can. What the
+    /// rename changes is which path is open *during* the copy, and reaching that
+    /// needs a second upload landing inside it. It pins the half that outlives
+    /// the request, which is the half a later edit can quietly drop.
+    #[tokio::test]
+    async fn a_finished_restore_leaves_no_scratch_file_behind() {
+        let dir = std::env::temp_dir().join(format!("monitor-restore-{}", &random_token()[..16]));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("live.db").to_string_lossy().into_owned();
+        let app = std::sync::Arc::new(App::for_test(Db::open(&live).unwrap()));
+        node(&app, "kept", true);
+
+        // What a restore is actually handed: a backup of a hub database.
+        let copy = format!("{live}.copy");
+        app.db.backup_into(&copy).unwrap();
+        let bytes = std::fs::read(&copy).unwrap();
+        std::fs::remove_file(&copy).unwrap();
+
+        let done = db_restore(
+            Admin,
+            State(app.clone()),
+            Query(Chunk { offset: 0, total: bytes.len() as u64 }),
+            HeaderMap::new(),
+            axum::body::Body::from(bytes),
+        )
+        .await;
+        assert_eq!(done.status(), StatusCode::OK);
+        assert_eq!(app.db.nodes().unwrap().len(), 1, "the backup went in");
+
+        // The database and its journal are the only things that may remain.
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|name| !matches!(name.as_str(), "live.db" | "live.db-wal" | "live.db-shm"))
+            .collect();
+        assert!(left.is_empty(), "left beside the database: {left:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A connected agent holding one report. The receiver comes back because
