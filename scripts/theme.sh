@@ -1,13 +1,7 @@
 #!/bin/sh
 # Materialises the pinned default theme into target/theme/, where rust-embed
-# picks it up.
-#
-# The hub embeds a *built* theme, not theme source. It used to get one out of
-# web-theme/, a directory the developer was told to clone by hand -- a build
-# input that was undeclared, mutable and never verified, so a hub could be
-# built against a stale theme and say nothing at all about it. There is no such
-# directory now: the input is derived from web-theme.pin every time, into a
-# place nobody works in, so there is no second checkout left to drift.
+# picks it up. The hub embeds a *built* theme derived from web-theme.pin,
+# into a place nobody works in, so there is no checkout left to drift.
 #
 # Called by build.rs, and by CI before cargo runs -- CI so that the download
 # happens on the runner rather than inside the cross container, which is not
