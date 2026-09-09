@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { CalendarClock, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
+import { CalendarClock, CircleDollarSign, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
+import { Cost } from "@/components/Cost"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
@@ -1536,6 +1537,7 @@ function Data() {
 // and a reload lands on the section it was on.
 const ADMIN_SECTIONS = [
   { path: "/admin/nodes", label: "节点", icon: Server },
+  { path: "/admin/cost", label: "成本", icon: CircleDollarSign },
   { path: "/admin/ping", label: "延迟", icon: Radio },
   { path: "/admin/data", label: "数据", icon: Database },
   { path: "/admin/themes", label: "主题", icon: Palette },
@@ -1580,7 +1582,9 @@ export function Admin({
       </nav>
 
       <div className="min-w-0 flex-1">
-        {path === "/admin/ping" ? (
+        {path === "/admin/cost" ? (
+          <Cost nodes={nodes} />
+        ) : path === "/admin/ping" ? (
           <Ping nodes={nodes} />
         ) : path === "/admin/data" ? (
           <Data />
