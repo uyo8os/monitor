@@ -32,6 +32,11 @@ use db::Db;
 
 pub type Shared = Arc<App>;
 
+pub(crate) struct FxSnapshot {
+    pub(crate) rates: HashMap<String, f64>,
+    pub(crate) fetched_at: i64,
+}
+
 pub struct App {
     pub db: Db,
     /// Every connected agent: its outbound channel, the session that opened it
@@ -42,6 +47,7 @@ pub struct App {
     /// millisecond it was built. Shared by every browser stream so viewers do
     /// not multiply the query load. See `api::live_snapshot`.
     pub snapshot: Mutex<[(i64, axum::extract::ws::Utf8Bytes); 2]>,
+    pub(crate) fx: Mutex<Option<FxSnapshot>>,
     pub throttle: auth::Throttle,
     /// Failed agent registrations, counted apart from failed sign-ins: the two
     /// have different threat models, and a batch install run with a stale key
@@ -67,6 +73,7 @@ impl App {
             db,
             agents: RwLock::default(),
             snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
+            fx: Mutex::new(None),
             throttle: auth::Throttle::default(),
             registrations: auth::Throttle::default(),
             http: reqwest::Client::builder()
@@ -361,6 +368,8 @@ async fn main() -> Result<()> {
         .route("/api/me", get(api::me))
         .route("/api/nodes", get(api::nodes))
         .route("/api/nodes/{id}/metrics", get(api::metrics))
+        .route("/api/cost/fx", get(api::fx))
+        .route("/api/cost/fx/refresh", post(api::refresh_fx))
         .route("/api/ws", get(api::live_ws))
         // Sign-in.
         .route("/api/auth/login", post(auth::login))

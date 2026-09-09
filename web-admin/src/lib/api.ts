@@ -63,6 +63,16 @@ export type Node = {
   token?: string
 }
 
+export type FxStatus = "latest" | "cached" | "expired" | "unavailable"
+
+export type FxSnapshot = {
+  status: FxStatus
+  provider: string
+  base_currency: string
+  fetched_at: string | null
+  rates: Record<string, number>
+}
+
 export type PingTask = { id: number; name: string; target: string; interval: number; nodes: number[] }
 
 /** Form snapshots must never overwrite fields the user did not edit. */
@@ -124,6 +134,14 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   })
   if (!res.ok) throw new ApiError(res.status, (await res.text()) || res.statusText)
   return res.status === 204 ? (undefined as T) : res.json()
+}
+
+export function getFxSnapshot() {
+  return api<FxSnapshot>("/cost/fx")
+}
+
+export function refreshFxSnapshot() {
+  return api<FxSnapshot>("/cost/fx/refresh", { method: "POST" })
 }
 
 /**

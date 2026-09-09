@@ -1,5 +1,7 @@
 //! The panel and public-status HTTP surface.
 
+use std::collections::HashMap;
+
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
@@ -17,7 +19,97 @@ use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
 };
 use crate::db::{Node, NodePatch, PingTask, Traffic, TrafficPatch};
-use crate::{agent_ws, App, Shared};
+use crate::{agent_ws, App, FxSnapshot, Shared};
+
+/// The only upstream used for cost summaries. Keeping this URL in the hub
+/// prevents a browser-provided URL from turning the refresh button into an
+/// SSRF primitive.
+const FX_URL: &str = "https://api.frankfurter.app/latest?from=USD";
+const FX_PROVIDER: &str = "Frankfurter";
+const FX_LATEST_MAX_AGE: i64 = 72 * 3_600;
+const FX_CACHED_MAX_AGE: i64 = 7 * 86_400;
+
+#[derive(Deserialize)]
+struct FrankfurterResponse {
+    base: String,
+    rates: HashMap<String, f64>,
+}
+
+fn fx_status(fetched_at: i64) -> &'static str {
+    let age = Utc::now().timestamp().saturating_sub(fetched_at).max(0);
+    match age {
+        0..=FX_LATEST_MAX_AGE => "latest",
+        age if age <= FX_CACHED_MAX_AGE => "cached",
+        _ => "expired",
+    }
+}
+
+fn fx_json(snapshot: Option<&FxSnapshot>) -> Value {
+    let Some(snapshot) = snapshot else {
+        return json!({
+            "status": "unavailable",
+            "provider": FX_PROVIDER,
+            "base_currency": "USD",
+            "fetched_at": null,
+            "rates": {},
+        });
+    };
+    let fetched_at =
+        chrono::TimeZone::timestamp_opt(&Utc, snapshot.fetched_at, 0).single().map(|date| date.to_rfc3339());
+    json!({
+        "status": fx_status(snapshot.fetched_at),
+        "provider": FX_PROVIDER,
+        "base_currency": "USD",
+        "fetched_at": fetched_at,
+        "rates": &snapshot.rates,
+    })
+}
+
+async fn fetch_fx(app: &App) -> Result<FxSnapshot, anyhow::Error> {
+    let response = app.http.get(FX_URL).send().await.map_err(|e| anyhow::anyhow!("汇率服务暂不可用：{e}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("汇率服务暂不可用（上游返回 {status}）");
+    }
+    let payload = response
+        .json::<FrankfurterResponse>()
+        .await
+        .map_err(|e| anyhow::anyhow!("汇率服务返回无效数据：{e}"))?;
+    if !payload.base.eq_ignore_ascii_case("USD") {
+        anyhow::bail!("汇率服务返回的基准币种不是 USD");
+    }
+
+    let mut rates = HashMap::from([(String::from("USD"), 1.0)]);
+    for (currency, rate) in payload.rates {
+        let currency = currency.trim().to_ascii_uppercase();
+        if currency.len() == 3
+            && currency.bytes().all(|byte| byte.is_ascii_alphabetic())
+            && rate.is_finite()
+            && rate > 0.0
+        {
+            rates.insert(currency, rate);
+        }
+    }
+    if !rates.contains_key("CNY") {
+        anyhow::bail!("汇率服务未返回 CNY 汇率");
+    }
+    Ok(FxSnapshot { rates, fetched_at: Utc::now().timestamp() })
+}
+
+pub async fn fx(_: Admin, State(app): State<Shared>) -> Response {
+    let cache = app.fx.lock().unwrap_or_else(|e| e.into_inner());
+    Json(fx_json(cache.as_ref())).into_response()
+}
+
+pub async fn refresh_fx(_: Admin, State(app): State<Shared>) -> Response {
+    let snapshot = match fetch_fx(&app).await {
+        Ok(snapshot) => snapshot,
+        Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    };
+    let mut cache = app.fx.lock().unwrap_or_else(|e| e.into_inner());
+    *cache = Some(snapshot);
+    Json(fx_json(cache.as_ref())).into_response()
+}
 
 /// Present only on requests carrying a valid session. Handlers that take it
 /// cannot be reached unauthenticated, so the check cannot be forgotten.
