@@ -11,5 +11,11 @@ export default defineConfig({
   // %20 and the alias silently points nowhere.
   resolve: { alias: { "@": import.meta.dirname + "/src" } },
   build: { chunkSizeWarningLimit: 900 },
-  server: { proxy: { "/api": { target: "http://127.0.0.1:9911", ws: true } } },
+  server: {
+    proxy: {
+      "/api": { target: "http://127.0.0.1:9911", ws: true },
+      "/install.sh": { target: "http://127.0.0.1:9911" },
+      "/agent": { target: "http://127.0.0.1:9911" },
+    },
+  },
 })

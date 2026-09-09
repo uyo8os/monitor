@@ -99,8 +99,11 @@ cargo run -- --listen 127.0.0.1:9911 --db /tmp/dev.db --themes /tmp/themes
 cd web-admin && npm run dev
 ```
 
-后台开发服务器使用 `/admin/`。默认主题在它自己的检出里改，那边 `npm run dev` 的 Vite 同样把
-`/api` 和 WebSocket 代理到 9911。
+后台开发服务器使用 `/admin/`。开发时 Vite 会把 `/api`、`/install.sh`、`/agent/*` 和 WebSocket 代理到 hub；因此可以在同一台机器上用 HTTP localhost 完成添加节点和安装 agent。
+
+本地 HTTP provisioning 仅在 `cargo run` 的 debug hub、`--site` 为空且 hub 监听回环地址时开放；release 构建或非回环监听仍必须通过 HTTPS 域名。不要把本地 hub 用 `--listen 0.0.0.0` 暴露出去。
+
+默认主题在它自己的检出里改，那边 `npm run dev` 的 Vite 同样把 `/api` 和 WebSocket 代理到 9911。
 
 第三方主题不用加入 hub 仓库。构建后按下面的形状复制到 `--themes` 指向的目录，再到后台「主题」页
 切换：

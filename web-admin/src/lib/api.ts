@@ -93,13 +93,17 @@ export function trafficCorrection(
   )
 }
 
-/** Installation commands require a TLS origin with a domain, never an IP. */
-export function provisioningSite(site: string): string {
+/** Installation commands require a TLS origin with a domain, except local Vite development. */
+const LOCAL_DEV = (import.meta as ImportMeta & { env?: { DEV?: boolean } }).env?.DEV === true
+
+export function provisioningSite(site: string, allowLocal = LOCAL_DEV): string {
   try {
     const u = new URL(site)
+    const clean = !u.username && !u.password && u.pathname === "/" && !u.search && !u.hash
+    const loopback = u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]" || u.hostname === "::1"
+    if (allowLocal && u.protocol === "http:" && loopback && clean) return u.origin
     return u.protocol === "https:" && !u.hostname.startsWith("[") && !/^\d+\.\d+\.\d+\.\d+$/.test(u.hostname)
-      && u.hostname !== "localhost" && !u.hostname.endsWith(".localhost") && !u.username && !u.password
-      && u.pathname === "/" && !u.search && !u.hash ? u.origin : ""
+      && u.hostname !== "localhost" && !u.hostname.endsWith(".localhost") && clean ? u.origin : ""
   } catch {
     return ""
   }

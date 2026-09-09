@@ -56,10 +56,13 @@ pub struct App {
     pub site: String,
     /// Parent directory containing one folder per installed public theme.
     pub themes: PathBuf,
+    /// Allows HTTP provisioning only for a debug hub bound to loopback.
+    /// Release builds and non-loopback listeners never enable this exception.
+    pub(crate) local_dev_provisioning: bool,
 }
 
 impl App {
-    fn new(db: Db, site: String, themes: PathBuf) -> Self {
+    fn new(db: Db, site: String, themes: PathBuf, local_dev_provisioning: bool) -> Self {
         Self {
             db,
             agents: RwLock::default(),
@@ -72,12 +75,13 @@ impl App {
                 .expect("http client"),
             site,
             themes,
+            local_dev_provisioning,
         }
     }
 
     #[cfg(test)]
     pub fn for_test(db: Db) -> Self {
-        Self::new(db, String::new(), PathBuf::from("themes"))
+        Self::new(db, String::new(), PathBuf::from("themes"), false)
     }
 
     pub fn public_page(&self) -> bool {
@@ -296,7 +300,10 @@ async fn main() -> Result<()> {
 
     let args = parse_args()?;
     std::fs::create_dir_all(&args.themes)?;
-    let app = Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes));
+    let local_dev_provisioning =
+        cfg!(debug_assertions) && args.site.is_empty() && args.listen.ip().is_loopback();
+    let app =
+        Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes, local_dev_provisioning));
     let url = advertised_url(&args.site, args.listen);
     first_run(&app, &url)?;
     if exposed_over_plain_http(&url) {
@@ -601,7 +608,7 @@ mod tests {
     use axum::http::{StatusCode, Uri};
 
     fn app(site: &str) -> App {
-        App::new(Db::open(":memory:").unwrap(), site.into(), PathBuf::from("themes"))
+        App::new(Db::open(":memory:").unwrap(), site.into(), PathBuf::from("themes"), false)
     }
 
     /// A request as a reverse proxy would forward it, or as it arrives with

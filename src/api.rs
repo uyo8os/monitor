@@ -383,6 +383,32 @@ pub(crate) fn https_domain(site: &str) -> Option<reqwest::Url> {
     .then_some(url)
 }
 
+fn local_dev_provisioning_allowed(app: &App, host: &str, headers: &HeaderMap) -> bool {
+    if !app.local_dev_provisioning
+        || !app.site.is_empty()
+        || crate::forwarded_proto(headers).is_some_and(|scheme| scheme != "http")
+    {
+        return false;
+    }
+    let Some(url) = reqwest::Url::parse(&format!("http://{host}")).ok() else {
+        return false;
+    };
+    let Some(hostname) = url.host_str() else { return false };
+    let loopback =
+        hostname == "localhost" || hostname.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    if !loopback
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let expected = url.origin().ascii_serialization();
+    headers.get(header::ORIGIN).is_none_or(|origin| origin.to_str().ok() == Some(expected.as_str()))
+}
+
 /// Host and the proxy's scheme describe this request; --site must not turn
 /// an IP entry point into a domain entry point. The listener stays behind the
 /// trusted reverse proxy, which must preserve Host and set X-Forwarded-Proto.
@@ -400,7 +426,18 @@ fn provisioning_allowed(app: &App, headers: &HeaderMap) -> bool {
     };
     let forwarded = crate::forwarded_proto(headers);
     let https = forwarded.map_or_else(|| app.site.starts_with("https://"), |scheme| scheme == "https");
-    if !https || (!app.site.is_empty() && https_domain(&app.site).is_none()) {
+    if !https {
+        if local_dev_provisioning_allowed(app, host, headers) {
+            return true;
+        }
+        debug!(
+            "provisioning refused: not an https domain entry (X-Forwarded-Proto={forwarded:?}, --site={:?}); \
+             a TLS-terminating proxy has to send X-Forwarded-Proto: https",
+            app.site
+        );
+        return false;
+    }
+    if !app.site.is_empty() && https_domain(&app.site).is_none() {
         debug!(
             "provisioning refused: not an https domain entry (X-Forwarded-Proto={forwarded:?}, --site={:?}); \
              a TLS-terminating proxy has to send X-Forwarded-Proto: https",
@@ -1433,8 +1470,37 @@ mod tests {
         ])
     }
 
+    fn local_dev_headers() -> HeaderMap {
+        HeaderMap::from_iter([
+            (header::HOST, "localhost:5173".parse().unwrap()),
+            (header::ORIGIN, "http://localhost:5173".parse().unwrap()),
+        ])
+    }
+
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
+    }
+
+    #[test]
+    fn local_http_provisioning_is_only_enabled_for_loopback_debug_hubs() {
+        let mut state = app();
+        state.local_dev_provisioning = true;
+        assert!(provisioning_allowed(&state, &local_dev_headers()));
+
+        let mut external = local_dev_headers();
+        external.insert(header::HOST, "example.com:5173".parse().unwrap());
+        assert!(!provisioning_allowed(&state, &external));
+
+        let mut wrong_origin = local_dev_headers();
+        wrong_origin.insert(header::ORIGIN, "http://localhost:9911".parse().unwrap());
+        assert!(!provisioning_allowed(&state, &wrong_origin));
+
+        let mut forwarded_tls = local_dev_headers();
+        forwarded_tls.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert!(!provisioning_allowed(&state, &forwarded_tls));
+
+        state.local_dev_provisioning = false;
+        assert!(!provisioning_allowed(&state, &local_dev_headers()));
     }
 
     #[tokio::test]
