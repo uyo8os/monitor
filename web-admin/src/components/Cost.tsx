@@ -87,7 +87,7 @@ function expiry(node: Node): { status: CostStatus; label: string; daysLeft: numb
   if (Number.isNaN(date.getTime())) return { status: "active", label: "日期无效", daysLeft: null }
   const daysLeft = Math.ceil((date.getTime() - Date.now()) / 86_400_000)
   if (daysLeft < 0) return { status: "expired", label: "已过期", daysLeft }
-  if (daysLeft <= 30) return { status: "soon", label: `${daysLeft} 天内到期`, daysLeft }
+  if (daysLeft <= 7) return { status: "soon", label: `${daysLeft} 天内到期`, daysLeft }
   return { status: "active", label: `${daysLeft} 天后到期`, daysLeft }
 }
 
