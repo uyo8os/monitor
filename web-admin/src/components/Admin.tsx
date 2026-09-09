@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { CalendarClock, CircleDollarSign, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
+import { Activity, Bell, CalendarClock, ChevronDown, ChevronRight, CircleDollarSign, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Server, Settings, Settings2, Shield, SlidersHorizontal, Trash2, Upload, WifiOff } from "lucide-react"
 import { toast } from "sonner"
 
 import { Cost } from "@/components/Cost"
+import { NotificationPlaceholder, NotificationSettings } from "@/components/Notification"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
@@ -1545,6 +1546,13 @@ const ADMIN_SECTIONS = [
   { path: "/admin/settings", label: "设置", icon: Settings },
 ] as const
 
+const NOTIFICATION_SECTIONS = [
+  { path: "/admin/notification/settings", label: "通知设置", icon: Settings2 },
+  { path: "/admin/notification/offline", label: "离线通知", icon: WifiOff },
+  { path: "/admin/notification/load", label: "负载通知", icon: Activity },
+  { path: "/admin/notification/general", label: "通用", icon: SlidersHorizontal },
+] as const
+
 export function Admin({
   path,
   go,
@@ -1560,29 +1568,99 @@ export function Admin({
   site: string
   canProvision: boolean
 }) {
+  const notificationActive = NOTIFICATION_SECTIONS.some(({ path: to }) => path === to)
+  const [notificationExpanded, setNotificationExpanded] = useState(notificationActive)
+  const notificationOpen = notificationExpanded
+  const renderNotificationLinks = (collapseOnSelect: boolean) =>
+    NOTIFICATION_SECTIONS.map(({ path: childPath, label: childLabel, icon: ChildIcon }) => {
+      const childActive = path === childPath
+      return (
+        <button
+          key={childPath}
+          type="button"
+          onClick={() => {
+            if (collapseOnSelect) setNotificationExpanded(false)
+            go(childPath)
+          }}
+          aria-current={childActive ? "page" : undefined}
+          className={`flex w-full shrink-0 items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors ${
+            childActive ? "bg-secondary font-medium" : "text-muted-foreground hover:bg-muted"
+          }`}
+        >
+          <ChildIcon className="size-4" />
+          {childLabel}
+        </button>
+      )
+    })
+
   return (
     <div className="flex flex-col gap-6 md:flex-row">
-      <nav className="flex gap-1 overflow-x-auto md:w-44 md:shrink-0 md:flex-col md:overflow-visible">
-        {ADMIN_SECTIONS.map(({ path: to, label, icon: Icon }) => {
-          const active = path === to
-          return (
-            <button
-              key={to}
-              onClick={() => go(to)}
-              aria-current={active ? "page" : undefined}
-              className={`flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors ${
-                active ? "bg-secondary font-medium" : "text-muted-foreground hover:bg-muted"
-              }`}
-            >
-              <Icon className="size-4" />
-              {label}
-            </button>
-          )
-        })}
+      <nav className="flex flex-col gap-1 md:w-44 md:shrink-0">
+        <div
+          className="flex w-full min-w-0 gap-1 overflow-x-auto md:contents"
+          onScroll={() => setNotificationExpanded(false)}
+        >
+          {ADMIN_SECTIONS.map(({ path: to, label, icon: Icon }) => {
+            const active = path === to
+            return (
+              <div key={to} className="contents">
+                <button
+                  type="button"
+                  onClick={() => go(to)}
+                  aria-current={active ? "page" : undefined}
+                  className={`flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors ${
+                    active ? "bg-secondary font-medium" : "text-muted-foreground hover:bg-muted"
+                  }`}
+                >
+                  <Icon className="size-4" />
+                  {label}
+                </button>
+                {to === "/admin/ping" && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setNotificationExpanded((open) => !open)}
+                      aria-current={notificationActive ? "page" : undefined}
+                      aria-expanded={notificationOpen}
+                      aria-controls="notification-submenu"
+                      className={`flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors ${
+                        notificationActive ? "bg-secondary font-medium" : "text-muted-foreground hover:bg-muted"
+                      }`}
+                    >
+                      <Bell className="size-4" />
+                      <span>通知</span>
+                      <span className="ml-auto flex size-4 items-center justify-center" aria-hidden="true">
+                        {notificationOpen ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
+                      </span>
+                    </button>
+                    {notificationOpen && (
+                      <div className="hidden md:ml-6 md:flex md:flex-col md:gap-1 md:border-l md:pl-2">
+                        {renderNotificationLinks(false)}
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )
+          })}
+        </div>
+        {notificationOpen && (
+          <div id="notification-submenu" role="group" aria-label="通知子菜单" className="w-full min-w-0 border-l pl-3 md:hidden">
+            {renderNotificationLinks(true)}
+          </div>
+        )}
       </nav>
 
       <div className="min-w-0 flex-1">
-        {path === "/admin/cost" ? (
+        {path === "/admin/notification/settings" ? (
+          <NotificationSettings />
+        ) : path === "/admin/notification/offline" ? (
+          <NotificationPlaceholder title="离线通知" />
+        ) : path === "/admin/notification/load" ? (
+          <NotificationPlaceholder title="负载通知" />
+        ) : path === "/admin/notification/general" ? (
+          <NotificationPlaceholder title="通用" />
+        ) : path === "/admin/cost" ? (
           <Cost nodes={nodes} />
         ) : path === "/admin/ping" ? (
           <Ping nodes={nodes} />

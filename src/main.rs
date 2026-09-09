@@ -388,6 +388,11 @@ async fn main() -> Result<()> {
         .route("/api/sessions", get(api::sessions))
         .route("/api/sessions/{id}", delete(api::delete_session))
         .route("/api/settings", get(api::settings).put(api::save_settings))
+        .route(
+            "/api/notification/settings",
+            get(api::notification_settings).put(api::save_notification_settings),
+        )
+        .route("/api/notification/telegram/test", post(api::test_telegram))
         .route("/api/themes", get(api::themes))
         .route("/api/themes/{short}", delete(api::delete_theme))
         .route("/api/themes/{short}/preview", get(api::theme_preview))

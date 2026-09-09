@@ -144,6 +144,35 @@ export function refreshFxSnapshot() {
   return api<FxSnapshot>("/cost/fx/refresh", { method: "POST" })
 }
 
+export type NotificationSettings = {
+  enabled: boolean
+  telegram_bot_token_set: boolean
+  telegram_chat_id_masked: string
+  telegram_endpoint: string
+}
+
+export type NotificationSettingsPatch = {
+  enabled: boolean
+  bot_token?: string
+  chat_id?: string
+  endpoint: string
+}
+
+export function getNotificationSettings() {
+  return api<NotificationSettings>("/notification/settings")
+}
+
+export function saveNotificationSettings(patch: NotificationSettingsPatch) {
+  return api<NotificationSettings>("/notification/settings", {
+    method: "PUT",
+    body: JSON.stringify(patch),
+  })
+}
+
+export function sendTelegramTest() {
+  return api<{ ok: boolean }>("/notification/telegram/test", { method: "POST" })
+}
+
 /**
  * 4 MiB. The only number a reverse proxy has to pass, whatever the file behind
  * it weighs -- the hub accepts up to 8 MiB per request, so this can move

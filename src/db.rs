@@ -481,6 +481,20 @@ impl Db {
         Ok(())
     }
 
+    pub fn set_many(&self, values: &[(&str, &str)]) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        for (key, value) in values {
+            tx.execute(
+                "INSERT INTO setting (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     // ---- nodes ----
 
     pub fn nodes(&self) -> Result<Vec<Node>> {
@@ -1625,6 +1639,7 @@ mod tests {
             )
             .unwrap();
         assert!(db.check_backup(&bad).is_err(), "a view where a table belongs");
+        drop(empty);
 
         // Eight tables with the right names and none of the right columns.
         // Every gate above passes: it is a healthy SQLite file, it carries no
@@ -1633,7 +1648,7 @@ mod tests {
         // pages, so those columns would be the ones the hub then runs every
         // statement against -- and it did, answering the panel "restore
         // failed" over a database that was already gone.
-        let _ = std::fs::remove_file(&bad);
+        std::fs::remove_file(&bad).unwrap();
         let shaped = Connection::open(&bad).unwrap();
         for table in TABLES {
             shaped.execute_batch(&format!("CREATE TABLE {table} (x TEXT)")).unwrap();
@@ -1643,9 +1658,10 @@ mod tests {
         // point; naming the table and the columns is.
         let refused = db.check_backup(&bad).unwrap_err().to_string();
         assert!(refused.contains("table is missing"), "{refused}");
+        drop(shaped);
 
         // From a hub that knows a schema this build has never seen.
-        let _ = std::fs::remove_file(&bad);
+        std::fs::remove_file(&bad).unwrap();
         let newer = Connection::open(&bad).unwrap();
         newer.execute_batch(SCHEMA).unwrap();
         newer.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1)).unwrap();

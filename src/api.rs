@@ -111,6 +111,200 @@ pub async fn refresh_fx(_: Admin, State(app): State<Shared>) -> Response {
     Json(fx_json(cache.as_ref())).into_response()
 }
 
+const NOTIFICATION_ENABLED_KEY: &str = "notification_enabled";
+const TELEGRAM_BOT_TOKEN_KEY: &str = "telegram_bot_token";
+const TELEGRAM_CHAT_ID_KEY: &str = "telegram_chat_id";
+const TELEGRAM_ENDPOINT_KEY: &str = "telegram_endpoint";
+const TELEGRAM_ENDPOINT_DEFAULT: &str = "https://api.telegram.org/bot";
+
+#[derive(Deserialize)]
+pub struct NotificationSettingsInput {
+    enabled: Option<bool>,
+    bot_token: Option<String>,
+    chat_id: Option<String>,
+    endpoint: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TelegramResponse {
+    ok: bool,
+}
+
+fn notification_enabled(app: &App) -> bool {
+    matches!(app.db.get(NOTIFICATION_ENABLED_KEY).as_deref(), Some("on" | "true" | "1"))
+}
+
+fn mask_chat_id(value: Option<&str>) -> String {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return String::new();
+    };
+    let suffix: String = value.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("****{suffix}")
+}
+
+fn notification_settings_json(app: &App) -> Value {
+    let endpoint = app
+        .db
+        .get(TELEGRAM_ENDPOINT_KEY)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| TELEGRAM_ENDPOINT_DEFAULT.to_owned());
+    json!({
+        "enabled": notification_enabled(app),
+        "telegram_bot_token_set": app.db.get(TELEGRAM_BOT_TOKEN_KEY).is_some_and(|value| !value.trim().is_empty()),
+        "telegram_chat_id_masked": mask_chat_id(app.db.get(TELEGRAM_CHAT_ID_KEY).as_deref()),
+        "telegram_endpoint": endpoint,
+    })
+}
+
+/// Telegram endpoint is kept as a visible setting for compatibility with the
+/// provider terminology, but the hub never sends credentials to an arbitrary
+/// host. Only the official Bot API base path is accepted.
+fn normalize_telegram_endpoint(value: &str) -> Result<String, &'static str> {
+    let value = if value.trim().is_empty() { TELEGRAM_ENDPOINT_DEFAULT } else { value.trim() };
+    let url = reqwest::Url::parse(value).map_err(|_| "请求端点必须是 Telegram 官方 HTTPS 端点")?;
+    let official_host = url.host_str().is_some_and(|host| host.eq_ignore_ascii_case("api.telegram.org"));
+    if url.scheme() != "https"
+        || !official_host
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "/bot" | "/bot/")
+    {
+        return Err("请求端点只能是 https://api.telegram.org/bot");
+    }
+    Ok(TELEGRAM_ENDPOINT_DEFAULT.to_owned())
+}
+
+fn normalize_telegram_token(value: &str) -> Result<String, &'static str> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 256
+        || !value.contains(':')
+        || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-'))
+    {
+        return Err("Telegram Bot Token 格式无效");
+    }
+    Ok(value.to_owned())
+}
+
+fn normalize_telegram_chat_id(value: &str) -> Result<String, &'static str> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+        return Err("Telegram Chat ID 不能为空且不能包含控制字符");
+    }
+    Ok(value.to_owned())
+}
+
+async fn send_telegram_test(
+    app: &App,
+    token: &str,
+    chat_id: &str,
+    endpoint: &str,
+) -> Result<(), &'static str> {
+    let endpoint = normalize_telegram_endpoint(endpoint)?;
+    let token = normalize_telegram_token(token)?;
+    let chat_id = normalize_telegram_chat_id(chat_id)?;
+    let url = reqwest::Url::parse(&format!("{endpoint}{token}/sendMessage"))
+        .map_err(|_| "Telegram 请求地址无效")?;
+    let form = [
+        ("chat_id", chat_id.as_str()),
+        ("text", "这是一条来自 Monitor 的 Telegram 测试消息。"),
+        ("parse_mode", "HTML"),
+    ];
+    let response =
+        app.http.post(url).form(&form).send().await.map_err(|_| "无法连接 Telegram，请检查网络或配置")?;
+    let status = response.status();
+    let result = response.json::<TelegramResponse>().await.map_err(|_| "Telegram 返回了无效响应")?;
+    if !status.is_success() {
+        return Err("Telegram 接口请求失败");
+    }
+    if !result.ok {
+        return Err("Telegram 拒绝了测试消息");
+    }
+    Ok(())
+}
+
+pub async fn notification_settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
+    Json(notification_settings_json(&app))
+}
+
+pub async fn save_notification_settings(
+    _: Admin,
+    State(app): State<Shared>,
+    Json(body): Json<NotificationSettingsInput>,
+) -> Response {
+    let NotificationSettingsInput { enabled, bot_token, chat_id, endpoint } = body;
+    let current_token = app.db.get(TELEGRAM_BOT_TOKEN_KEY).unwrap_or_default();
+    let current_chat_id = app.db.get(TELEGRAM_CHAT_ID_KEY).unwrap_or_default();
+    let current_endpoint =
+        app.db.get(TELEGRAM_ENDPOINT_KEY).unwrap_or_else(|| TELEGRAM_ENDPOINT_DEFAULT.to_owned());
+
+    let token = match bot_token {
+        Some(value) if !value.trim().is_empty() => match normalize_telegram_token(&value) {
+            Ok(value) => value,
+            Err(message) => return bad(message),
+        },
+        _ => current_token.trim().to_owned(),
+    };
+    let chat_id = match chat_id {
+        Some(value) if !value.trim().is_empty() => match normalize_telegram_chat_id(&value) {
+            Ok(value) => value,
+            Err(message) => return bad(message),
+        },
+        _ => current_chat_id.trim().to_owned(),
+    };
+    let endpoint = match normalize_telegram_endpoint(endpoint.as_deref().unwrap_or(current_endpoint.as_str()))
+    {
+        Ok(value) => value,
+        Err(message) => return bad(message),
+    };
+    let enabled = enabled.unwrap_or_else(|| notification_enabled(&app));
+
+    if enabled {
+        if token.is_empty() {
+            return bad("开启通知前请先保存 Telegram Bot Token");
+        }
+        if let Err(message) = normalize_telegram_token(&token) {
+            return bad(message);
+        }
+        if chat_id.is_empty() {
+            return bad("开启通知前请先保存 Telegram Chat ID");
+        }
+        if let Err(message) = normalize_telegram_chat_id(&chat_id) {
+            return bad(message);
+        }
+    }
+
+    if let Err(error) = app.db.set_many(&[
+        (TELEGRAM_BOT_TOKEN_KEY, token.as_str()),
+        (TELEGRAM_CHAT_ID_KEY, chat_id.as_str()),
+        (TELEGRAM_ENDPOINT_KEY, endpoint.as_str()),
+        (NOTIFICATION_ENABLED_KEY, if enabled { "on" } else { "off" }),
+    ]) {
+        return fail(error);
+    }
+    Json(notification_settings_json(&app)).into_response()
+}
+
+/// The test deliberately uses the saved provider configuration directly. It
+/// does not treat a disabled notification switch as a successful no-op.
+pub async fn test_telegram(_: Admin, State(app): State<Shared>) -> Response {
+    let Some(token) = app.db.get(TELEGRAM_BOT_TOKEN_KEY).filter(|value| !value.trim().is_empty()) else {
+        return bad("请先保存 Telegram Bot Token");
+    };
+    let Some(chat_id) = app.db.get(TELEGRAM_CHAT_ID_KEY).filter(|value| !value.trim().is_empty()) else {
+        return bad("请先保存 Telegram Chat ID");
+    };
+    let endpoint = app.db.get(TELEGRAM_ENDPOINT_KEY).unwrap_or_else(|| TELEGRAM_ENDPOINT_DEFAULT.to_owned());
+
+    match send_telegram_test(&app, &token, &chat_id, &endpoint).await {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(message) => (StatusCode::BAD_GATEWAY, message).into_response(),
+    }
+}
+
 /// Present only on requests carrying a valid session. Handlers that take it
 /// cannot be reached unauthenticated, so the check cannot be forgotten.
 pub struct Admin;
@@ -1836,6 +2030,7 @@ mod tests {
             .filter(|name| !matches!(name.as_str(), "live.db" | "live.db-wal" | "live.db-shm"))
             .collect();
         assert!(left.is_empty(), "left beside the database: {left:?}");
+        drop(app);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
