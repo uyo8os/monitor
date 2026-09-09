@@ -1,6 +1,6 @@
 //! The panel and public-status HTTP surface.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
@@ -112,14 +112,34 @@ pub async fn refresh_fx(_: Admin, State(app): State<Shared>) -> Response {
 }
 
 const NOTIFICATION_ENABLED_KEY: &str = "notification_enabled";
+const OFFLINE_NOTIFICATION_ENABLED_KEY: &str = "offline_notification_enabled";
+const ONLINE_NOTIFICATION_ENABLED_KEY: &str = "online_notification_enabled";
+const NOTIFICATION_EXCLUDED_NODE_IDS_KEY: &str = "notification_excluded_node_ids";
+const OFFLINE_DELAY_SECONDS_KEY: &str = "offline_delay_seconds";
 const TELEGRAM_BOT_TOKEN_KEY: &str = "telegram_bot_token";
 const TELEGRAM_CHAT_ID_KEY: &str = "telegram_chat_id";
 const TELEGRAM_ENDPOINT_KEY: &str = "telegram_endpoint";
 const TELEGRAM_ENDPOINT_DEFAULT: &str = "https://api.telegram.org/bot";
+pub(crate) const DEFAULT_OFFLINE_DELAY_SECONDS: i64 = 180;
+const MAX_OFFLINE_DELAY_SECONDS: i64 = 86_400;
+const MAX_EXCLUDED_NODE_IDS: usize = 1_000;
+
+#[derive(Clone)]
+pub(crate) struct NotificationConfig {
+    pub(crate) enabled: bool,
+    pub(crate) offline_enabled: bool,
+    pub(crate) online_enabled: bool,
+    pub(crate) offline_delay_seconds: i64,
+    pub(crate) excluded_node_ids: HashSet<i64>,
+}
 
 #[derive(Deserialize)]
 pub struct NotificationSettingsInput {
     enabled: Option<bool>,
+    offline_enabled: Option<bool>,
+    online_enabled: Option<bool>,
+    excluded_node_ids: Option<Vec<i64>>,
+    offline_delay_seconds: Option<i64>,
     bot_token: Option<String>,
     chat_id: Option<String>,
     endpoint: Option<String>,
@@ -130,8 +150,43 @@ struct TelegramResponse {
     ok: bool,
 }
 
-fn notification_enabled(app: &App) -> bool {
-    matches!(app.db.get(NOTIFICATION_ENABLED_KEY).as_deref(), Some("on" | "true" | "1"))
+fn setting_enabled(app: &App, key: &str, default: bool) -> bool {
+    match app.db.get(key).as_deref() {
+        Some("on" | "true" | "1") => true,
+        Some("off" | "false" | "0") => false,
+        _ => default,
+    }
+}
+
+fn parse_excluded_node_ids(value: Option<&str>) -> HashSet<i64> {
+    let Some(value) = value else { return HashSet::new() };
+    let Ok(values) = serde_json::from_str::<Vec<i64>>(value) else { return HashSet::new() };
+    if values.len() > MAX_EXCLUDED_NODE_IDS {
+        return HashSet::new();
+    }
+    values.into_iter().filter(|id| *id > 0).collect()
+}
+
+fn sorted_excluded_node_ids(ids: &HashSet<i64>) -> Vec<i64> {
+    let mut ids: Vec<_> = ids.iter().copied().collect();
+    ids.sort_unstable();
+    ids
+}
+
+pub(crate) fn notification_config(app: &App) -> NotificationConfig {
+    let delay = app
+        .db
+        .get(OFFLINE_DELAY_SECONDS_KEY)
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| (0..=MAX_OFFLINE_DELAY_SECONDS).contains(value))
+        .unwrap_or(DEFAULT_OFFLINE_DELAY_SECONDS);
+    NotificationConfig {
+        enabled: setting_enabled(app, NOTIFICATION_ENABLED_KEY, false),
+        offline_enabled: setting_enabled(app, OFFLINE_NOTIFICATION_ENABLED_KEY, true),
+        online_enabled: setting_enabled(app, ONLINE_NOTIFICATION_ENABLED_KEY, true),
+        offline_delay_seconds: delay,
+        excluded_node_ids: parse_excluded_node_ids(app.db.get(NOTIFICATION_EXCLUDED_NODE_IDS_KEY).as_deref()),
+    }
 }
 
 fn mask_chat_id(value: Option<&str>) -> String {
@@ -143,13 +198,18 @@ fn mask_chat_id(value: Option<&str>) -> String {
 }
 
 fn notification_settings_json(app: &App) -> Value {
+    let config = notification_config(app);
     let endpoint = app
         .db
         .get(TELEGRAM_ENDPOINT_KEY)
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| TELEGRAM_ENDPOINT_DEFAULT.to_owned());
     json!({
-        "enabled": notification_enabled(app),
+        "enabled": config.enabled,
+        "offline_enabled": config.offline_enabled,
+        "online_enabled": config.online_enabled,
+        "offline_delay_seconds": config.offline_delay_seconds,
+        "excluded_node_ids": sorted_excluded_node_ids(&config.excluded_node_ids),
         "telegram_bot_token_set": app.db.get(TELEGRAM_BOT_TOKEN_KEY).is_some_and(|value| !value.trim().is_empty()),
         "telegram_chat_id_masked": mask_chat_id(app.db.get(TELEGRAM_CHAT_ID_KEY).as_deref()),
         "telegram_endpoint": endpoint,
@@ -197,33 +257,78 @@ fn normalize_telegram_chat_id(value: &str) -> Result<String, &'static str> {
     Ok(value.to_owned())
 }
 
-async fn send_telegram_test(
-    app: &App,
-    token: &str,
-    chat_id: &str,
-    endpoint: &str,
-) -> Result<(), &'static str> {
-    let endpoint = normalize_telegram_endpoint(endpoint)?;
-    let token = normalize_telegram_token(token)?;
-    let chat_id = normalize_telegram_chat_id(chat_id)?;
+/// Sends a message using the saved Telegram configuration. The token and
+/// endpoint are validated again on every event, so a malformed legacy setting
+/// cannot turn a node lifecycle event into an arbitrary outbound request.
+pub(crate) async fn send_telegram_message(app: &App, text: &str) -> Result<(), &'static str> {
+    let (token, chat_id, endpoint) = tokio::task::block_in_place(|| {
+        let token = app
+            .db
+            .get(TELEGRAM_BOT_TOKEN_KEY)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("请先保存 Telegram Bot Token")?;
+        let chat_id = app
+            .db
+            .get(TELEGRAM_CHAT_ID_KEY)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("请先保存 Telegram Chat ID")?;
+        let endpoint =
+            app.db.get(TELEGRAM_ENDPOINT_KEY).unwrap_or_else(|| TELEGRAM_ENDPOINT_DEFAULT.to_owned());
+        Ok::<_, &'static str>((token, chat_id, endpoint))
+    })?;
+    let endpoint = normalize_telegram_endpoint(&endpoint)?;
+    let token = normalize_telegram_token(&token)?;
+    let chat_id = normalize_telegram_chat_id(&chat_id)?;
     let url = reqwest::Url::parse(&format!("{endpoint}{token}/sendMessage"))
         .map_err(|_| "Telegram 请求地址无效")?;
-    let form = [
-        ("chat_id", chat_id.as_str()),
-        ("text", "这是一条来自 Monitor 的 Telegram 测试消息。"),
-        ("parse_mode", "HTML"),
-    ];
-    let response =
-        app.http.post(url).form(&form).send().await.map_err(|_| "无法连接 Telegram，请检查网络或配置")?;
+    let form = [("chat_id", chat_id.as_str()), ("text", text), ("parse_mode", "HTML")];
+    let response = app
+        .telegram_http
+        .post(url)
+        .form(&form)
+        .send()
+        .await
+        .map_err(|_| "无法连接 Telegram，请检查网络或配置")?;
     let status = response.status();
     let result = response.json::<TelegramResponse>().await.map_err(|_| "Telegram 返回了无效响应")?;
     if !status.is_success() {
         return Err("Telegram 接口请求失败");
     }
     if !result.ok {
-        return Err("Telegram 拒绝了测试消息");
+        return Err("Telegram 拒绝了消息");
     }
     Ok(())
+}
+
+async fn send_telegram_test(app: &App) -> Result<(), &'static str> {
+    send_telegram_message(app, "这是一条来自 Monitor 的 Telegram 测试消息。").await
+}
+
+fn normalize_offline_delay(value: i64) -> Result<i64, &'static str> {
+    if (0..=MAX_OFFLINE_DELAY_SECONDS).contains(&value) {
+        Ok(value)
+    } else {
+        Err("离线宽限期必须是 0 到 86400 秒之间的整数")
+    }
+}
+
+fn normalize_excluded_node_ids(values: Vec<i64>, existing: &HashSet<i64>) -> Result<HashSet<i64>, String> {
+    if values.len() > MAX_EXCLUDED_NODE_IDS {
+        return Err(format!("排除节点数量不能超过 {MAX_EXCLUDED_NODE_IDS} 个"));
+    }
+    if values.iter().any(|id| *id <= 0) {
+        return Err("排除节点 ID 必须是正数".to_owned());
+    }
+    let ids: HashSet<_> = values.into_iter().collect();
+    let mut unknown: Vec<_> = ids.difference(existing).copied().collect();
+    if !unknown.is_empty() {
+        unknown.sort_unstable();
+        return Err(format!(
+            "排除列表包含不存在的节点 ID：{}",
+            unknown.iter().map(i64::to_string).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    Ok(ids)
 }
 
 pub async fn notification_settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
@@ -235,11 +340,34 @@ pub async fn save_notification_settings(
     State(app): State<Shared>,
     Json(body): Json<NotificationSettingsInput>,
 ) -> Response {
-    let NotificationSettingsInput { enabled, bot_token, chat_id, endpoint } = body;
+    let NotificationSettingsInput {
+        enabled,
+        offline_enabled,
+        online_enabled,
+        excluded_node_ids,
+        offline_delay_seconds,
+        bot_token,
+        chat_id,
+        endpoint,
+    } = body;
     let current_token = app.db.get(TELEGRAM_BOT_TOKEN_KEY).unwrap_or_default();
     let current_chat_id = app.db.get(TELEGRAM_CHAT_ID_KEY).unwrap_or_default();
     let current_endpoint =
         app.db.get(TELEGRAM_ENDPOINT_KEY).unwrap_or_else(|| TELEGRAM_ENDPOINT_DEFAULT.to_owned());
+    let current_config = notification_config(&app);
+    let excluded_node_ids = match excluded_node_ids {
+        Some(values) => {
+            let existing: HashSet<_> = match app.db.nodes() {
+                Ok(nodes) => nodes.into_iter().map(|node| node.id).collect(),
+                Err(error) => return fail(error),
+            };
+            match normalize_excluded_node_ids(values, &existing) {
+                Ok(ids) => ids,
+                Err(message) => return bad(&message),
+            }
+        }
+        None => current_config.excluded_node_ids.clone(),
+    };
 
     let token = match bot_token {
         Some(value) if !value.trim().is_empty() => match normalize_telegram_token(&value) {
@@ -260,7 +388,16 @@ pub async fn save_notification_settings(
         Ok(value) => value,
         Err(message) => return bad(message),
     };
-    let enabled = enabled.unwrap_or_else(|| notification_enabled(&app));
+    let enabled = enabled.unwrap_or(current_config.enabled);
+    let offline_enabled = offline_enabled.unwrap_or(current_config.offline_enabled);
+    let online_enabled = online_enabled.unwrap_or(current_config.online_enabled);
+    let offline_delay_seconds = match offline_delay_seconds {
+        Some(value) => match normalize_offline_delay(value) {
+            Ok(value) => value,
+            Err(message) => return bad(message),
+        },
+        None => current_config.offline_delay_seconds,
+    };
 
     if enabled {
         if token.is_empty() {
@@ -277,29 +414,43 @@ pub async fn save_notification_settings(
         }
     }
 
-    if let Err(error) = app.db.set_many(&[
-        (TELEGRAM_BOT_TOKEN_KEY, token.as_str()),
-        (TELEGRAM_CHAT_ID_KEY, chat_id.as_str()),
-        (TELEGRAM_ENDPOINT_KEY, endpoint.as_str()),
-        (NOTIFICATION_ENABLED_KEY, if enabled { "on" } else { "off" }),
-    ]) {
-        return fail(error);
+    let delay = offline_delay_seconds.to_string();
+    let excluded_node_ids_json = match serde_json::to_string(&sorted_excluded_node_ids(&excluded_node_ids)) {
+        Ok(value) => value,
+        Err(error) => return fail(error),
+    };
+    let missing = match app.db.set_many_if_nodes_exist(
+        &[
+            (TELEGRAM_BOT_TOKEN_KEY, token.as_str()),
+            (TELEGRAM_CHAT_ID_KEY, chat_id.as_str()),
+            (TELEGRAM_ENDPOINT_KEY, endpoint.as_str()),
+            (NOTIFICATION_ENABLED_KEY, if enabled { "on" } else { "off" }),
+            (OFFLINE_NOTIFICATION_ENABLED_KEY, if offline_enabled { "on" } else { "off" }),
+            (ONLINE_NOTIFICATION_ENABLED_KEY, if online_enabled { "on" } else { "off" }),
+            (NOTIFICATION_EXCLUDED_NODE_IDS_KEY, excluded_node_ids_json.as_str()),
+            (OFFLINE_DELAY_SECONDS_KEY, delay.as_str()),
+        ],
+        &excluded_node_ids,
+    ) {
+        Ok(missing) => missing,
+        Err(error) => return fail(error),
+    };
+    if !missing.is_empty() {
+        let mut missing = missing;
+        missing.sort_unstable();
+        return bad(&format!(
+            "排除列表包含不存在的节点 ID：{}",
+            missing.iter().map(i64::to_string).collect::<Vec<_>>().join(", ")
+        ));
     }
+    app.notifications.refresh_exclusions(app.clone(), &excluded_node_ids);
     Json(notification_settings_json(&app)).into_response()
 }
 
 /// The test deliberately uses the saved provider configuration directly. It
 /// does not treat a disabled notification switch as a successful no-op.
 pub async fn test_telegram(_: Admin, State(app): State<Shared>) -> Response {
-    let Some(token) = app.db.get(TELEGRAM_BOT_TOKEN_KEY).filter(|value| !value.trim().is_empty()) else {
-        return bad("请先保存 Telegram Bot Token");
-    };
-    let Some(chat_id) = app.db.get(TELEGRAM_CHAT_ID_KEY).filter(|value| !value.trim().is_empty()) else {
-        return bad("请先保存 Telegram Chat ID");
-    };
-    let endpoint = app.db.get(TELEGRAM_ENDPOINT_KEY).unwrap_or_else(|| TELEGRAM_ENDPOINT_DEFAULT.to_owned());
-
-    match send_telegram_test(&app, &token, &chat_id, &endpoint).await {
+    match send_telegram_test(&app).await {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
         Err(message) => (StatusCode::BAD_GATEWAY, message).into_response(),
     }
@@ -973,6 +1124,7 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     // next node created, which then reads as online on somebody else's
     // metrics. Same reason as `reset_token` below.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    app.notifications.invalidate_node(id);
     match app.db.delete_node(id) {
         Ok(()) => {
             invalidate_snapshot(&app);
@@ -997,6 +1149,7 @@ pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     // reconnects and is refused. Its own teardown leaves the entry alone,
     // because the session tag no longer matches.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    app.notifications.invalidate_node(id);
     // The token is part of the admin frame, which would otherwise go on
     // showing an install command for the credential just retired.
     invalidate_snapshot(&app);
@@ -1356,6 +1509,8 @@ pub async fn db_restore(
             // senders ends those loops; each reconnects against the database
             // that is actually here.
             app.agents.write().unwrap_or_else(|e| e.into_inner()).clear();
+            app.notifications.invalidate_all();
+            app.notifications.resume_pending(app.clone()).await;
             invalidate_snapshot(&app);
             let cookie = match app.db.drop_all_sessions().and_then(|()| issue_session(&app, &headers)) {
                 Ok(cookie) => cookie,

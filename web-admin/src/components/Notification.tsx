@@ -6,6 +6,7 @@ import {
   getNotificationSettings,
   saveNotificationSettings,
   sendTelegramTest,
+  type Node,
   type NotificationSettings as NotificationSettingsData,
 } from "@/lib/api"
 import { Button } from "@/components/ui/button"
@@ -180,5 +181,207 @@ export function NotificationPlaceholder({ title }: { title: string }) {
       <h2 className="text-lg font-semibold">{title}</h2>
       <p className="text-sm leading-relaxed text-muted-foreground">该通知功能暂未实现。</p>
     </Card>
+  )
+}
+
+export function OfflineNotificationSettings({ nodes }: { nodes: Node[] }) {
+  const [settings, setSettings] = useState<NotificationSettingsData | null>(null)
+  const [offlineEnabled, setOfflineEnabled] = useState(true)
+  const [onlineEnabled, setOnlineEnabled] = useState(true)
+  const [delaySeconds, setDelaySeconds] = useState("180")
+  const [excludedNodeIds, setExcludedNodeIds] = useState<number[]>([])
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState("")
+  const nodeIdentity = nodes.map((node) => `${node.id}:${node.name}`).join("|")
+
+  useEffect(() => {
+    let active = true
+    getNotificationSettings()
+      .then((next) => {
+        if (!active) return
+        setSettings(next)
+        setOfflineEnabled(next.offline_enabled)
+        setOnlineEnabled(next.online_enabled)
+        setDelaySeconds(String(next.offline_delay_seconds))
+        setExcludedNodeIds(next.excluded_node_ids)
+        setError("")
+      })
+      .catch((reason: Error) => {
+        if (active) setError(reason.message || "离线通知设置加载失败")
+      })
+      .finally(() => {
+        if (active) setLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [nodeIdentity])
+
+  async function save() {
+    const delay = Number(delaySeconds.trim())
+    if (!Number.isInteger(delay) || delay < 0 || delay > 86400) {
+      toast.error("离线宽限期必须是 0 到 86400 秒之间的整数")
+      return
+    }
+    const availableNodeIds = new Set(nodes.map((node) => node.id))
+    const validExcludedNodeIds = excludedNodeIds.filter((id) => availableNodeIds.has(id))
+    if (validExcludedNodeIds.length !== excludedNodeIds.length) {
+      setExcludedNodeIds(validExcludedNodeIds)
+    }
+    setSaving(true)
+    try {
+      const next = await saveNotificationSettings({
+        offline_enabled: offlineEnabled,
+        online_enabled: onlineEnabled,
+        offline_delay_seconds: delay,
+        excluded_node_ids: validExcludedNodeIds,
+      })
+      setSettings(next)
+      setOfflineEnabled(next.offline_enabled)
+      setOnlineEnabled(next.online_enabled)
+      setDelaySeconds(String(next.offline_delay_seconds))
+      setExcludedNodeIds(next.excluded_node_ids)
+      toast.success("离线通知设置已保存")
+    } catch (reason) {
+      toast.error(reason instanceof Error ? reason.message : "离线通知设置保存失败")
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  function toggleExcludedNode(nodeId: number) {
+    setExcludedNodeIds((current) =>
+      current.includes(nodeId)
+        ? current.filter((id) => id !== nodeId)
+        : [...current, nodeId].sort((a, b) => a - b),
+    )
+  }
+
+  function selectAllNodes() {
+    setExcludedNodeIds(nodes.map((node) => node.id).sort((a, b) => a - b))
+  }
+
+  if (loading) return <p className="text-sm text-muted-foreground">加载离线通知设置…</p>
+  if (error) return <p className="text-sm text-destructive" role="alert">{error}</p>
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <h2 className="text-lg font-semibold">离线通知</h2>
+        <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
+          节点断开后先等待宽限期；宽限期内恢复不会发送消息，持续离线后只发送一次离线通知，恢复连接时发送一次上线通知。
+        </p>
+      </div>
+
+      <Card className="gap-5 p-5">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <Label htmlFor="offline-notification-enabled">发送离线通知</Label>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">需要同时开启“通知设置”中的全局通知开关。</p>
+          </div>
+          <Switch
+            id="offline-notification-enabled"
+            checked={offlineEnabled}
+            onCheckedChange={setOfflineEnabled}
+            disabled={saving}
+          />
+        </div>
+
+        <div className="border-t pt-5">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <Label htmlFor="online-notification-enabled">发送上线恢复通知</Label>
+              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">只有已经发送过离线通知的节点恢复时才会发送。</p>
+            </div>
+            <Switch
+              id="online-notification-enabled"
+              checked={onlineEnabled}
+              onCheckedChange={setOnlineEnabled}
+              disabled={saving}
+            />
+          </div>
+        </div>
+
+        <div className="border-t pt-5">
+          <Label htmlFor="offline-delay-seconds">离线宽限期（秒）</Label>
+          <Input
+            id="offline-delay-seconds"
+            className="mt-2 max-w-xs"
+            type="number"
+            min={0}
+            max={86400}
+            step={1}
+            value={delaySeconds}
+            onChange={(event) => setDelaySeconds(event.target.value)}
+            disabled={saving}
+          />
+          <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+            默认 180 秒，范围 0–86400 秒。设置为 0 表示连接释放后立即进入离线通知。
+          </p>
+        </div>
+
+        <div className="border-t pt-5">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <Label>排除节点</Label>
+              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                选中的节点不会发送离线或上线恢复通知；节点采集和在线状态不受影响。
+              </p>
+            </div>
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={selectAllNodes}
+                disabled={saving || nodes.length === 0}
+              >
+                全选
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={() => setExcludedNodeIds([])}
+                disabled={saving || excludedNodeIds.length === 0}
+              >
+                清空
+              </Button>
+            </div>
+          </div>
+          <div className="mt-3 max-h-64 space-y-1 overflow-y-auto rounded-lg border bg-muted/20 p-2">
+            {nodes.map((node) => (
+              <label
+                key={node.id}
+                className="flex cursor-pointer items-center gap-3 rounded-md px-2.5 py-2 text-sm hover:bg-background"
+              >
+                <input
+                  type="checkbox"
+                  checked={excludedNodeIds.includes(node.id)}
+                  onChange={() => toggleExcludedNode(node.id)}
+                  disabled={saving}
+                  className="accent-primary"
+                />
+                <span className="min-w-0">
+                  <span className="block truncate">{node.name}</span>
+                  <span className="tnum block text-xs text-muted-foreground">ID: {node.id}</span>
+                </span>
+              </label>
+            ))}
+            {nodes.length === 0 && <p className="p-2 text-xs text-muted-foreground">先添加节点</p>}
+          </div>
+          <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+            当前已排除 {excludedNodeIds.length} 个节点。
+          </p>
+        </div>
+
+        <div className="border-t pt-4">
+          <Button type="button" onClick={() => void save()} disabled={saving || !settings}>
+            {saving ? "保存中…" : "保存设置"}
+          </Button>
+        </div>
+      </Card>
+    </div>
   )
 }

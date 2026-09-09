@@ -32,6 +32,15 @@ CREATE TABLE IF NOT EXISTS setting (
   value TEXT NOT NULL
 );
 
+-- Durable notification state is deliberately not part of TABLES below: an
+-- older backup can be migrated by creating this table before its pages are
+-- copied into the live database.
+CREATE TABLE IF NOT EXISTS notification_state (
+  node_id INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
+  pending_since INTEGER,
+  offline_confirmed INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS node (
   id            INTEGER PRIMARY KEY,
   name          TEXT    NOT NULL,
@@ -122,7 +131,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Bump it and add a `migrate_to_N` when the schema changes under a database
 /// that is already in service.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Adds a column that older databases lack. A duplicate column means the
 /// migration has already run; every other error is real and must propagate.
@@ -218,6 +227,20 @@ fn migrate_to_3(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "country TEXT NOT NULL DEFAULT ''")
 }
 
+/// Adds the optional notification state table to databases and backups made
+/// before offline notifications existed. It is idempotent because `SCHEMA`
+/// also creates it for a fresh connection.
+fn migrate_to_4(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS notification_state (
+           node_id INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
+           pending_since INTEGER,
+           offline_confirmed INTEGER NOT NULL DEFAULT 0
+         );",
+    )?;
+    Ok(())
+}
+
 /// Brings a database that is already in service up to `SCHEMA_VERSION` and
 /// stamps it. `from` is the version it is at now, so a fresh file passes
 /// `SCHEMA_VERSION` and only gets the stamp.
@@ -234,6 +257,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 3 {
         migrate_to_3(conn)?;
     }
+    // This table is optional in older backups, so make the migration
+    // idempotent even when the version stamp already says 4.
+    migrate_to_4(conn)?;
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     Ok(())
 }
@@ -495,6 +521,123 @@ impl Db {
         Ok(())
     }
 
+    /// Writes settings only if every referenced node still exists. The
+    /// existence check and write share one transaction so deleting a node
+    /// cannot race this validation and leave its ID in the exclusion list.
+    pub fn set_many_if_nodes_exist(
+        &self,
+        values: &[(&str, &str)],
+        node_ids: &HashSet<i64>,
+    ) -> Result<Vec<i64>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut missing = Vec::new();
+        for &node_id in node_ids {
+            let exists: i64 =
+                tx.query_row("SELECT EXISTS(SELECT 1 FROM node WHERE id=?1)", [node_id], |row| row.get(0))?;
+            if exists == 0 {
+                missing.push(node_id);
+            }
+        }
+        if !missing.is_empty() {
+            return Ok(missing);
+        }
+        for (key, value) in values {
+            tx.execute(
+                "INSERT INTO setting (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )?;
+        }
+        tx.commit()?;
+        Ok(Vec::new())
+    }
+
+    // ---- notification state ----
+
+    /// Starts a grace-period transition unless this node is already confirmed
+    /// offline. The latter guard is the durable half of notification de-dup.
+    pub fn mark_notification_pending(&self, node_id: i64, pending_since: i64) -> Result<bool> {
+        let changed = self.conn().execute(
+            "INSERT INTO notification_state (node_id, pending_since, offline_confirmed)
+             VALUES (?1, ?2, 0)
+             ON CONFLICT(node_id) DO UPDATE SET pending_since=excluded.pending_since
+             WHERE notification_state.offline_confirmed=0",
+            params![node_id, pending_since],
+        )?;
+        Ok(changed != 0)
+    }
+
+    /// Clears a pending transition when an agent reconnects or when the event
+    /// is disabled. Returns whether a confirmed offline state was consumed.
+    pub fn take_notification_offline(&self, node_id: i64) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let confirmed: i64 = tx
+            .query_row(
+                "SELECT offline_confirmed FROM notification_state WHERE node_id=?1",
+                [node_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        tx.execute(
+            "UPDATE notification_state
+             SET pending_since=NULL, offline_confirmed=0
+             WHERE node_id=?1",
+            [node_id],
+        )?;
+        tx.commit()?;
+        Ok(confirmed != 0)
+    }
+
+    /// Lists transitions that were pending when the hub last stopped. The
+    /// notification manager resumes their timers before accepting connections.
+    pub fn pending_notification_states(&self) -> Result<Vec<(i64, i64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT node_id, pending_since FROM notification_state
+             WHERE pending_since IS NOT NULL AND offline_confirmed=0",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Claims a pending transition exactly once. It is claimed before the
+    /// network request so a late timer or repeated teardown cannot duplicate
+    /// an offline message.
+    pub fn confirm_notification_offline(&self, node_id: i64, pending_since: i64) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE notification_state
+             SET pending_since=NULL, offline_confirmed=1
+             WHERE node_id=?1 AND pending_since=?2 AND offline_confirmed=0",
+            params![node_id, pending_since],
+        )?;
+        Ok(changed != 0)
+    }
+
+    /// Drops a pending transition without turning it into a confirmed offline
+    /// state. `None` is used when the event is disabled at disconnect time.
+    pub fn discard_notification_pending(&self, node_id: i64, pending_since: Option<i64>) -> Result<()> {
+        match pending_since {
+            Some(pending_since) => {
+                self.conn().execute(
+                    "UPDATE notification_state SET pending_since=NULL
+                     WHERE node_id=?1 AND pending_since=?2 AND offline_confirmed=0",
+                    params![node_id, pending_since],
+                )?;
+            }
+            None => {
+                self.conn().execute(
+                    "UPDATE notification_state SET pending_since=NULL
+                     WHERE node_id=?1 AND offline_confirmed=0",
+                    [node_id],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     // ---- nodes ----
 
     pub fn nodes(&self) -> Result<Vec<Node>> {
@@ -613,13 +756,39 @@ impl Db {
     }
 
     pub fn delete_node(&self, id: i64) -> Result<()> {
-        let conn = self.conn();
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
         // `ping_record` carries no foreign key -- it is WITHOUT ROWID and keyed
         // for the chart query -- so it is cleared by hand. SQLite hands a
         // deleted node's id straight to the next one created, which would
         // otherwise inherit the dead machine's latency chart.
-        conn.execute("DELETE FROM ping_record WHERE node_id = ?1", [id])?;
-        conn.execute("DELETE FROM node WHERE id = ?1", [id])?;
+        tx.execute("DELETE FROM ping_record WHERE node_id = ?1", [id])?;
+        tx.execute("DELETE FROM node WHERE id = ?1", [id])?;
+
+        // The setting is a JSON array rather than a relational table. Remove
+        // the deleted ID in the same transaction so a future node reusing this
+        // SQLite ID cannot inherit its notification exclusion.
+        if let Some(value) = tx
+            .query_row("SELECT value FROM setting WHERE key = 'notification_excluded_node_ids'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+        {
+            if let Ok(mut ids) = serde_json::from_str::<Vec<i64>>(&value) {
+                let original_len = ids.len();
+                ids.retain(|node_id| *node_id != id);
+                if ids.len() != original_len {
+                    ids.sort_unstable();
+                    ids.dedup();
+                    let value = serde_json::to_string(&ids)?;
+                    tx.execute(
+                        "UPDATE setting SET value = ?1 WHERE key = 'notification_excluded_node_ids'",
+                        [value],
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1359,6 +1528,16 @@ impl Db {
                 missing.sort_unstable();
                 anyhow::bail!("the file's {table} table is missing {}", missing.join(", "));
             }
+        }
+        // This table was added in schema 4 and is created by `migrate` for
+        // older backups. Validate it separately so old backups stay accepted
+        // while a malformed current backup cannot disable notification state.
+        let want = columns_of(&reference, "notification_state")?;
+        let got = columns_of(&candidate, "notification_state")?;
+        let mut missing: Vec<&str> = want.difference(&got).map(String::as_str).collect();
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            anyhow::bail!("the file's notification_state table is missing {}", missing.join(", "));
         }
         Ok(())
     }

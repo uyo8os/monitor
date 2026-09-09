@@ -4,7 +4,7 @@ import { Activity, Bell, CalendarClock, ChevronDown, ChevronRight, CircleDollarS
 import { toast } from "sonner"
 
 import { Cost } from "@/components/Cost"
-import { NotificationPlaceholder, NotificationSettings } from "@/components/Notification"
+import { NotificationPlaceholder, NotificationSettings, OfflineNotificationSettings } from "@/components/Notification"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
@@ -1655,7 +1655,7 @@ export function Admin({
         {path === "/admin/notification/settings" ? (
           <NotificationSettings />
         ) : path === "/admin/notification/offline" ? (
-          <NotificationPlaceholder title="离线通知" />
+          <OfflineNotificationSettings nodes={nodes} />
         ) : path === "/admin/notification/load" ? (
           <NotificationPlaceholder title="负载通知" />
         ) : path === "/admin/notification/general" ? (

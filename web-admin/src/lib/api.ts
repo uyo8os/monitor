@@ -146,16 +146,24 @@ export function refreshFxSnapshot() {
 
 export type NotificationSettings = {
   enabled: boolean
+  offline_enabled: boolean
+  online_enabled: boolean
+  offline_delay_seconds: number
+  excluded_node_ids: number[]
   telegram_bot_token_set: boolean
   telegram_chat_id_masked: string
   telegram_endpoint: string
 }
 
 export type NotificationSettingsPatch = {
-  enabled: boolean
+  enabled?: boolean
+  offline_enabled?: boolean
+  online_enabled?: boolean
+  offline_delay_seconds?: number
+  excluded_node_ids?: number[]
   bot_token?: string
   chat_id?: string
-  endpoint: string
+  endpoint?: string
 }
 
 export function getNotificationSettings() {

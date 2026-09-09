@@ -162,10 +162,24 @@ pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
 async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<String>(16);
     let session = SESSION.fetch_add(1, Ordering::Relaxed);
-    // Online from the handshake, not from the first report: a panel that says
-    // otherwise for a whole report interval is describing the hub's
-    // bookkeeping rather than the machine.
-    app.agents.write().unwrap_or_else(|e| e.into_inner()).insert(node_id, Agent::new(session, tx));
+    // Establish the notification generation before exposing the session in the
+    // agent map. A timer then cannot observe a live connection without its
+    // matching generation and claim an offline transition in the gap.
+    if !app.notifications.connected(app.clone(), node_id, session) {
+        return Err(anyhow::anyhow!("stale agent session {session}"));
+    }
+    let installed = {
+        let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
+        if agents.get(&node_id).is_some_and(|agent| agent.session > session) {
+            false
+        } else {
+            agents.insert(node_id, Agent::new(session, tx));
+            true
+        }
+    };
+    if !installed {
+        return Err(anyhow::anyhow!("stale agent session {session}"));
+    }
     info!("node {node_id} connected from {ip}");
 
     // Tell the agent what to probe before the first report arrives.
@@ -216,6 +230,7 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
     };
 
     if release(&app, node_id, session) {
+        app.notifications.disconnected(app.clone(), node_id, session);
         info!("node {node_id} went offline");
     }
     outcome

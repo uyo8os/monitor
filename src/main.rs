@@ -9,6 +9,7 @@ mod api;
 mod auth;
 mod db;
 mod frontend;
+mod notification;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -54,6 +55,11 @@ pub struct App {
     /// must not lock the operator out of the panel.
     pub registrations: auth::Throttle,
     pub http: reqwest::Client,
+    /// Telegram requests use a separate client so redirects can never move a
+    /// bot token request away from the validated official endpoint.
+    pub telegram_http: reqwest::Client,
+    /// Coordinates offline grace timers without holding the agent map lock.
+    pub notifications: notification::NotificationManager,
     /// Public base URL when `--site` was given, empty otherwise -- the
     /// default, where the hub is reached at whatever ip:port the browser used
     /// and the panel falls back to its own origin. Behind a reverse proxy it
@@ -80,6 +86,12 @@ impl App {
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .expect("http client"),
+            telegram_http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("telegram http client"),
+            notifications: notification::NotificationManager::default(),
             site,
             themes,
             local_dev_provisioning,
@@ -311,6 +323,7 @@ async fn main() -> Result<()> {
         cfg!(debug_assertions) && args.site.is_empty() && args.listen.ip().is_loopback();
     let app =
         Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes, local_dev_provisioning));
+    app.notifications.resume_pending(app.clone()).await;
     let url = advertised_url(&args.site, args.listen);
     first_run(&app, &url)?;
     if exposed_over_plain_http(&url) {
