@@ -1,0 +1,7 @@
+root = true
+
+# Do not impose one newline style on every file in the repository.
+# Shell scripts are POSIX build/runtime inputs and must remain LF-only.
+[*.sh]
+end_of_line = lf
+insert_final_newline = true

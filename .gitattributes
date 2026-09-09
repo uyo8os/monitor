@@ -1,3 +1,3 @@
-# Keep POSIX build inputs free of CRLF on Windows.
+# POSIX build inputs must remain LF-only on every platform.
 *.sh text eol=lf
 *.pin text eol=lf
