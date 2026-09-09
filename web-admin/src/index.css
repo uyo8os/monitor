@@ -106,6 +106,8 @@
   /* Reserve the scrollbar's width on every page: without it a route
      whose content clears the fold widens the page as you leave it. */
   html { scrollbar-gutter: stable; }
+  /* Radix RemoveScroll already has a stable gutter to preserve, so its body compensation would reserve it twice. */
+  html body[data-scroll-locked] { margin-right: 0 !important; }
   body { @apply bg-background text-foreground; }
   /* Tailwind v4 leaves `button` and `input` on the browser's default cursor
      (v3 made buttons a pointer). Radix renders Switch as a button, so without
