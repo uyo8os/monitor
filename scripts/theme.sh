@@ -13,6 +13,8 @@ cd "$(dirname "$0")/.."
 # gives -- the fields are set either way. Unguarded, set -e would exit here with
 # nothing printed and build.rs would point at the empty output it got.
 read -r TAG SHA <web-theme.pin || true
+# POSIX sh keeps a CR from a CRLF pin file, which is common on Windows.
+SHA=$(printf '%s' "$SHA" | tr -d '\r')
 [ -n "${TAG:-}" ] && [ -n "${SHA:-}" ] ||
   { echo "web-theme.pin must hold '<tag> <sha256>'" >&2; exit 1; }
 DEST=target/theme

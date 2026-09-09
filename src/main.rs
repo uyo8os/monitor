@@ -22,6 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 use chrono::{Local, Months, NaiveDate};
+#[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tower_http::compression::Predicate;
 use tracing::{info, warn};
@@ -428,6 +429,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 /// Waits for whichever stop signal arrives first. SIGTERM is the one that
 /// matters: it is how systemd stops a service, and without it a deploy kills
 /// the hub outright rather than letting it finish the requests it holds.
@@ -439,6 +441,14 @@ async fn shutdown() {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}
     }
+    info!("shutting down");
+}
+
+#[cfg(not(unix))]
+/// Windows has no Unix SIGTERM stream; Ctrl+C still gives console runs a
+/// graceful shutdown path.
+async fn shutdown() {
+    let _ = tokio::signal::ctrl_c().await;
     info!("shutting down");
 }
 
