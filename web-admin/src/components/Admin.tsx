@@ -589,6 +589,32 @@ function ExpiryInfo({ expiresAt }: { expiresAt: string | null }) {
   )
 }
 
+function CountryFlag({ country }: { country: string }) {
+  const code = country.trim().toUpperCase()
+  if (!code) return null
+
+  return (
+    <span
+      className="inline-flex h-5 w-7 shrink-0 items-center justify-center overflow-hidden rounded-sm border border-border/70 bg-background"
+      title={code}
+      aria-label={`${code} 国旗`}
+    >
+      <img
+        src={`/admin/assets/flags/${code}.svg`}
+        alt={`${code} 国旗`}
+        className="h-full w-full object-cover"
+        loading="lazy"
+        decoding="async"
+        onError={(event) => {
+          event.currentTarget.hidden = true
+          event.currentTarget.nextElementSibling?.removeAttribute("hidden")
+        }}
+      />
+      <span hidden className="px-0.5 text-[10px] font-semibold text-muted-foreground">{code}</span>
+    </span>
+  )
+}
+
 function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh: () => void; site: string; canProvision: boolean }) {
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
@@ -719,11 +745,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                       <GripVertical className="size-4" />
                     </button>
                     <div className="min-w-0 font-medium">{n.name}</div>
-                    {n.country && (
-                      <Badge variant="outline" className="shrink-0 font-normal text-muted-foreground">
-                        {n.country}
-                      </Badge>
-                    )}
+                    {n.country && <CountryFlag country={n.country} />}
                   </div>
                 </TableCell>
                 {/* Addresses live only here, never on the public page. */}
