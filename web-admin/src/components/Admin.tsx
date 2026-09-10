@@ -766,6 +766,11 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                     {n.online ? "在线" : "离线"}
                   </Badge>
                   {!n.public && <Badge variant="outline" className="ml-1 font-normal">不公开</Badge>}
+                  {n.online && n.agent_version && (
+                    <div className="tnum mt-1 text-xs text-muted-foreground">
+                      {n.agent_version.startsWith("v") ? n.agent_version : `v${n.agent_version}`}
+                    </div>
+                  )}
                   {/* Under the badge, not inside it: the column is a tenth of
                       the table and the three do not share one line. */}
                   {!n.online && n.last_seen > 0 && Date.now() / 1000 - n.last_seen >= 60 && (
