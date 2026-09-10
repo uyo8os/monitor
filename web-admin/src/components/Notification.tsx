@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react"
-import { Send } from "lucide-react"
+import { useEffect, useMemo, useState } from "react"
+import { Send, Server } from "lucide-react"
 import { toast } from "sonner"
 
 import {
@@ -14,6 +14,8 @@ import {
 } from "@/lib/api"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
+import { Badge } from "@/components/ui/badge"
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
@@ -394,7 +396,15 @@ export function OfflineNotificationSettings({ nodes }: { nodes: Node[] }) {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState("")
+  const [serverOpen, setServerOpen] = useState(false)
+  const [serverQuery, setServerQuery] = useState("")
+  const [workingExcludedNodeIds, setWorkingExcludedNodeIds] = useState<number[]>([])
   const nodeIdentity = nodes.map((node) => `${node.id}:${node.name}`).join("|")
+  const visibleServerNodes = useMemo(() => {
+    const needle = serverQuery.trim().toLowerCase()
+    if (!needle) return nodes
+    return nodes.filter((node) => node.name.toLowerCase().includes(needle) || String(node.id).includes(needle))
+  }, [nodes, serverQuery])
 
   useEffect(() => {
     let active = true
@@ -451,16 +461,27 @@ export function OfflineNotificationSettings({ nodes }: { nodes: Node[] }) {
     }
   }
 
-  function toggleExcludedNode(nodeId: number) {
-    setExcludedNodeIds((current) =>
+  function openServerSelector() {
+    setWorkingExcludedNodeIds([...excludedNodeIds])
+    setServerQuery("")
+    setServerOpen(true)
+  }
+
+  function toggleWorkingExcludedNode(nodeId: number) {
+    setWorkingExcludedNodeIds((current) =>
       current.includes(nodeId)
         ? current.filter((id) => id !== nodeId)
         : [...current, nodeId].sort((a, b) => a - b),
     )
   }
 
-  function selectAllNodes() {
-    setExcludedNodeIds(nodes.map((node) => node.id).sort((a, b) => a - b))
+  function selectAllWorkingNodes() {
+    setWorkingExcludedNodeIds(nodes.map((node) => node.id).sort((a, b) => a - b))
+  }
+
+  function completeServerSelection() {
+    setExcludedNodeIds([...workingExcludedNodeIds].sort((a, b) => a - b))
+    setServerOpen(false)
   }
 
   if (loading) return <p className="text-sm text-muted-foreground">加载离线通知设置…</p>
@@ -525,52 +546,27 @@ export function OfflineNotificationSettings({ nodes }: { nodes: Node[] }) {
         <div className="border-t pt-5">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <Label>排除节点</Label>
+              <Label>服务器排除</Label>
               <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                选中的节点不会发送离线或上线恢复通知；节点采集和在线状态不受影响。
+                选中的服务器不会发送离线或上线恢复通知；节点采集和在线状态不受影响。
               </p>
             </div>
-            <div className="flex gap-2">
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                onClick={selectAllNodes}
-                disabled={saving || nodes.length === 0}
-              >
-                全选
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                onClick={() => setExcludedNodeIds([])}
-                disabled={saving || excludedNodeIds.length === 0}
-              >
-                清空
-              </Button>
-            </div>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={openServerSelector}
+              disabled={saving}
+            >
+              <Server />
+              选择服务器（{excludedNodeIds.length}）
+            </Button>
           </div>
-          <div className="mt-3 max-h-64 space-y-1 overflow-y-auto rounded-lg border bg-muted/20 p-2">
-            {nodes.map((node) => (
-              <label
-                key={node.id}
-                className="flex cursor-pointer items-center gap-3 rounded-md px-2.5 py-2 text-sm hover:bg-background"
-              >
-                <input
-                  type="checkbox"
-                  checked={excludedNodeIds.includes(node.id)}
-                  onChange={() => toggleExcludedNode(node.id)}
-                  disabled={saving}
-                  className="accent-primary"
-                />
-                <span className="min-w-0">
-                  <span className="block truncate">{node.name}</span>
-                  <span className="tnum block text-xs text-muted-foreground">ID: {node.id}</span>
-                </span>
-              </label>
-            ))}
-            {nodes.length === 0 && <p className="p-2 text-xs text-muted-foreground">先添加节点</p>}
+          <div className="flex min-h-10 flex-wrap gap-2 rounded-lg border bg-muted/20 p-2">
+            {excludedNodeIds.map((nodeId) => {
+              const node = nodes.find((item) => item.id === nodeId)
+              return <Badge key={nodeId} variant="secondary">{node?.name ?? `ID ${nodeId}`}</Badge>
+            })}
+            {excludedNodeIds.length === 0 && <span className="p-1 text-sm text-muted-foreground">尚未选择服务器</span>}
           </div>
           <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
             当前已排除 {excludedNodeIds.length} 个节点。
@@ -583,6 +579,83 @@ export function OfflineNotificationSettings({ nodes }: { nodes: Node[] }) {
           </Button>
         </div>
       </Card>
+
+      <Dialog open={serverOpen} onOpenChange={setServerOpen}>
+        <DialogContent className="sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle>选择服务器</DialogTitle>
+            <DialogDescription>选择不发送离线或上线恢复通知的服务器。</DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-wrap items-center gap-2">
+            <Input
+              value={serverQuery}
+              onChange={(event) => setServerQuery(event.target.value)}
+              placeholder="搜索服务器名称或 ID"
+              className="min-w-52 flex-1"
+              disabled={saving}
+            />
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={selectAllWorkingNodes}
+              disabled={saving || nodes.length === 0}
+            >
+              全选
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => setWorkingExcludedNodeIds([])}
+              disabled={saving || workingExcludedNodeIds.length === 0}
+            >
+              清空
+            </Button>
+          </div>
+          <div className="text-xs text-muted-foreground">
+            已选择 {workingExcludedNodeIds.length} / {nodes.length} 台服务器
+          </div>
+          <div className="max-h-80 space-y-1 overflow-y-auto rounded-lg border bg-muted/20 p-2">
+            {visibleServerNodes.map((node) => {
+              const checked = workingExcludedNodeIds.includes(node.id)
+              return (
+                <label
+                  key={node.id}
+                  className="flex cursor-pointer items-center gap-3 rounded-md px-2.5 py-2 hover:bg-background"
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => toggleWorkingExcludedNode(node.id)}
+                    disabled={saving}
+                    aria-label={`选择 ${node.name}`}
+                    className="accent-primary"
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-center gap-2 text-sm">
+                      <span className="truncate">{node.name}</span>
+                      <Badge variant={node.online ? "online" : "offline"} className="shrink-0 border-transparent">
+                        {node.online ? "在线" : "离线"}
+                      </Badge>
+                    </span>
+                    <span className="tnum block text-xs text-muted-foreground">ID: {node.id}</span>
+                  </span>
+                </label>
+              )
+            })}
+            {visibleServerNodes.length === 0 && (
+              <p className="p-3 text-sm text-muted-foreground">
+                {nodes.length === 0 ? "暂无服务器，请先添加服务器" : "没有匹配的服务器"}
+              </p>
+            )}
+          </div>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setServerOpen(false)} disabled={saving}>取消</Button>
+            <Button type="button" onClick={completeServerSelection} disabled={saving}>完成</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }
