@@ -168,14 +168,36 @@ CREATE TABLE IF NOT EXISTS ping_record (
 
 CREATE TABLE IF NOT EXISTS session (
   token_hash TEXT    PRIMARY KEY,
-  expires_at INTEGER NOT NULL
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  login_ip TEXT NOT NULL DEFAULT '',
+  auth_method TEXT NOT NULL DEFAULT 'unknown',
+  user_agent TEXT NOT NULL DEFAULT ''
 );
+
+-- Durable outbox rows for notifications that are independent of connection
+-- lifecycle and load-rule alert state. `node_id` is nullable for login events;
+-- node-owned events disappear with the node and cannot leak into a reused ID.
+CREATE TABLE IF NOT EXISTS common_notification_event (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  node_id INTEGER REFERENCES node(id) ON DELETE CASCADE,
+  period_key TEXT NOT NULL DEFAULT '',
+  bucket INTEGER NOT NULL DEFAULT 0,
+  payload TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  claimed_at INTEGER,
+  completed_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_common_notification_pending
+  ON common_notification_event(kind, completed_at, claimed_at);
 "#;
 
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Bump it and add a `migrate_to_N` when the schema changes under a database
 /// that is already in service.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Adds a column that older databases lack. A duplicate column means the
 /// migration has already run; every other error is real and must propagate.
@@ -330,6 +352,37 @@ fn migrate_to_5(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_to_6(conn: &Connection) -> Result<()> {
+    // Existing session rows predate metadata. Their creation time can be
+    // reconstructed from the fixed 14-day lifetime; the other fields remain
+    // empty rather than inventing an address or authentication method.
+    add_column(conn, "session", "created_at INTEGER NOT NULL DEFAULT 0")?;
+    add_column(conn, "session", "login_ip TEXT NOT NULL DEFAULT ''")?;
+    add_column(conn, "session", "auth_method TEXT NOT NULL DEFAULT 'unknown'")?;
+    add_column(conn, "session", "user_agent TEXT NOT NULL DEFAULT ''")?;
+    conn.execute(
+        "UPDATE session SET created_at=CASE WHEN expires_at >= 1209600
+         THEN expires_at - 1209600 ELSE 0 END WHERE created_at=0",
+        [],
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS common_notification_event (
+           id TEXT PRIMARY KEY,
+           kind TEXT NOT NULL,
+           node_id INTEGER REFERENCES node(id) ON DELETE CASCADE,
+           period_key TEXT NOT NULL DEFAULT '',
+           bucket INTEGER NOT NULL DEFAULT 0,
+           payload TEXT NOT NULL DEFAULT '',
+           created_at INTEGER NOT NULL,
+           claimed_at INTEGER,
+           completed_at INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS idx_common_notification_pending
+           ON common_notification_event(kind, completed_at, claimed_at);",
+    )?;
+    Ok(())
+}
+
 /// Brings a database that is already in service up to `SCHEMA_VERSION` and
 /// stamps it. `from` is the version it is at now, so a fresh file passes
 /// `SCHEMA_VERSION` and only gets the stamp.
@@ -350,12 +403,13 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     // idempotent even when the version stamp already says 4.
     migrate_to_4(conn)?;
     migrate_to_5(conn)?;
+    migrate_to_6(conn)?;
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     Ok(())
 }
 
 /// Every table a backup has to carry before this build will restore it.
-const TABLES: [&str; 11] = [
+const TABLES: [&str; 12] = [
     "setting",
     "node",
     "traffic",
@@ -367,6 +421,7 @@ const TABLES: [&str; 11] = [
     "load_rule",
     "load_rule_node",
     "load_alert_state",
+    "common_notification_event",
 ];
 
 /// One node's stored configuration and last known facts.
@@ -495,6 +550,26 @@ pub struct Traffic {
     pub month_start: String,
     pub day_rx: i64,
     pub day_tx: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionRecord {
+    pub token_hash: String,
+    pub expires_at: i64,
+    pub created_at: i64,
+    pub login_ip: String,
+    pub auth_method: String,
+    pub user_agent: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommonNotificationEvent {
+    pub id: String,
+    pub kind: String,
+    pub node_id: Option<i64>,
+    pub period_key: String,
+    pub bucket: i64,
+    pub payload: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -926,6 +1001,35 @@ impl Db {
     pub fn set_expiry(&self, id: i64, date: &str) -> Result<()> {
         self.conn().execute("UPDATE node SET expires_at=?2 WHERE id=?1", params![id, date])?;
         Ok(())
+    }
+
+    /// Updates an expiry date and creates the matching renewal outbox row in
+    /// one transaction. The conditional update makes repeated scheduler runs
+    /// unable to enqueue a second event for the same actual change.
+    pub fn set_expiry_and_enqueue_renew_event(
+        &self,
+        id: i64,
+        date: &str,
+        now: i64,
+        enqueue_event: bool,
+    ) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE node SET expires_at=?2
+             WHERE id=?1 AND (expires_at IS NULL OR expires_at <> ?2)",
+            params![id, date],
+        )?;
+        if changed == 1 && enqueue_event {
+            tx.execute(
+                "INSERT OR IGNORE INTO common_notification_event
+                 (id, kind, node_id, period_key, bucket, payload, created_at)
+                 VALUES (?1, 'renew', ?2, ?3, 0, '', ?4)",
+                params![format!("renew:{id}:{date}"), id, date, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed == 1)
     }
 
     pub fn reorder_nodes(&self, ids: &[i64]) -> Result<()> {
@@ -1855,7 +1959,12 @@ impl Db {
         let conn = self.conn();
         let a = conn.execute("DELETE FROM metric WHERE ts < ?1", [cutoff])?;
         let b = conn.execute("DELETE FROM ping_record WHERE ts < ?1", [cutoff])?;
-        Ok(a + b)
+        let c = conn.execute(
+            "DELETE FROM common_notification_event
+             WHERE completed_at IS NOT NULL AND completed_at < ?1",
+            [cutoff],
+        )?;
+        Ok(a + b + c)
     }
 
     // ---- ping ----
@@ -2309,10 +2418,53 @@ impl Db {
     // ---- sessions ----
 
     pub fn create_session(&self, token_hash: &str, expires_at: i64) -> Result<()> {
-        self.conn().execute(
-            "INSERT OR REPLACE INTO session (token_hash, expires_at) VALUES (?1, ?2)",
-            params![token_hash, expires_at],
+        self.create_session_with_metadata(
+            token_hash,
+            expires_at,
+            expires_at.saturating_sub(14 * 86_400),
+            "",
+            "unknown",
+            "",
+            false,
+        )
+    }
+
+    /// Creates a session and, for an interactive login, its durable login
+    /// notification event in one transaction. The restore/password-change
+    /// paths use the legacy helper and intentionally do not announce a login.
+    pub fn create_session_with_metadata(
+        &self,
+        token_hash: &str,
+        expires_at: i64,
+        created_at: i64,
+        login_ip: &str,
+        auth_method: &str,
+        user_agent: &str,
+        notify_login: bool,
+    ) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO session
+             (token_hash, expires_at, created_at, login_ip, auth_method, user_agent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![token_hash, expires_at, created_at, login_ip, auth_method, user_agent],
         )?;
+        if notify_login {
+            let payload = serde_json::json!({
+                "ip": login_ip,
+                "auth_method": auth_method,
+                "user_agent": user_agent,
+            })
+            .to_string();
+            tx.execute(
+                "INSERT OR IGNORE INTO common_notification_event
+                 (id, kind, node_id, period_key, bucket, payload, created_at)
+                 VALUES (?1, 'login', NULL, '', 0, ?2, ?3)",
+                params![format!("login:{token_hash}"), payload, created_at],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -2331,13 +2483,23 @@ impl Db {
 
     /// Live sessions, newest first. Expired rows are filtered here rather than
     /// left to `expire_sessions`, which only sweeps once an hour.
-    pub fn sessions(&self) -> Result<Vec<(String, i64)>> {
+    pub fn sessions(&self) -> Result<Vec<SessionRecord>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT token_hash, expires_at FROM session WHERE expires_at > ?1 ORDER BY expires_at DESC",
+            "SELECT token_hash, expires_at, created_at, login_ip, auth_method, user_agent
+             FROM session WHERE expires_at > ?1 ORDER BY created_at DESC, expires_at DESC",
         )?;
         let rows = stmt
-            .query_map([Utc::now().timestamp()], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map([Utc::now().timestamp()], |r| {
+                Ok(SessionRecord {
+                    token_hash: r.get(0)?,
+                    expires_at: r.get(1)?,
+                    created_at: r.get(2)?,
+                    login_ip: r.get(3)?,
+                    auth_method: r.get(4)?,
+                    user_agent: r.get(5)?,
+                })
+            })?
             .collect::<Result<_, _>>()?;
         Ok(rows)
     }
@@ -2355,6 +2517,90 @@ impl Db {
 
     pub fn expire_sessions(&self) -> Result<()> {
         self.conn().execute("DELETE FROM session WHERE expires_at <= ?1", [Utc::now().timestamp()])?;
+        Ok(())
+    }
+
+    // ---- common notification outbox ----
+
+    pub fn enqueue_common_event(
+        &self,
+        id: &str,
+        kind: &str,
+        node_id: Option<i64>,
+        period_key: &str,
+        bucket: i64,
+        payload: &str,
+        created_at: i64,
+    ) -> Result<bool> {
+        let changed = self.conn().execute(
+            "INSERT OR IGNORE INTO common_notification_event
+             (id, kind, node_id, period_key, bucket, payload, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![id, kind, node_id, period_key, bucket, payload, created_at],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn pending_common_events(&self, kind: &str) -> Result<Vec<CommonNotificationEvent>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, node_id, period_key, bucket, payload
+             FROM common_notification_event
+             WHERE kind=?1 AND completed_at IS NULL ORDER BY created_at, id",
+        )?;
+        let rows = stmt
+            .query_map([kind], |row| {
+                Ok(CommonNotificationEvent {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    node_id: row.get(2)?,
+                    period_key: row.get(3)?,
+                    bucket: row.get(4)?,
+                    payload: row.get(5)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Claims an event before any network request. A stale claim is recoverable
+    /// after a crash or a task cancellation, while a live claim stays single
+    /// delivery even if two scheduler ticks overlap.
+    pub fn claim_common_event(&self, id: &str, now: i64, stale_after: i64) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE common_notification_event
+             SET claimed_at=?2
+             WHERE id=?1 AND completed_at IS NULL
+               AND (claimed_at IS NULL OR claimed_at <= ?2-?3)",
+            params![id, now, stale_after.max(1)],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn release_common_event(&self, id: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE common_notification_event SET claimed_at=NULL
+             WHERE id=?1 AND completed_at IS NULL",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_common_event(&self, id: &str, now: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE common_notification_event
+             SET claimed_at=NULL, completed_at=?2 WHERE id=?1 AND completed_at IS NULL",
+            params![id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Discards a pending event whose snapshot is no longer valid. Deleting
+    /// rather than completing it lets the next evaluation enqueue a fresh row
+    /// with the same deterministic id after a traffic configuration change.
+    pub fn delete_common_event(&self, id: &str) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM common_notification_event WHERE id=?1 AND completed_at IS NULL", [id])?;
         Ok(())
     }
 }
@@ -3442,5 +3688,118 @@ mod load_notification_db_tests {
                 .unwrap(),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod common_notification_db_tests {
+    use std::sync::{Arc, Barrier};
+
+    use super::*;
+
+    #[test]
+    fn schema_v6_migrates_old_sessions_and_keeps_new_metadata_atomic() {
+        let path = std::env::temp_dir().join(format!("monitor-schema-v6-{}.db", rand::random::<u64>()));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE session (token_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
+                 PRAGMA user_version = 5;",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 6);
+        let columns = columns_of(&db.conn(), "session").unwrap();
+        for column in ["created_at", "login_ip", "auth_method", "user_agent"] {
+            assert!(columns.contains(column), "missing migrated session column {column}");
+        }
+
+        let now = Utc::now().timestamp();
+        db.create_session_with_metadata(
+            "session-hash",
+            now + 3_600,
+            now,
+            "203.0.113.8",
+            "github",
+            "browser/1",
+            true,
+        )
+        .unwrap();
+        let session = db.sessions().unwrap().pop().unwrap();
+        assert_eq!(session.created_at, now);
+        assert_eq!(session.login_ip, "203.0.113.8");
+        assert_eq!(session.auth_method, "github");
+        assert_eq!(session.user_agent, "browser/1");
+        assert_eq!(db.pending_common_events("login").unwrap().len(), 1);
+
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.to_string_lossy()));
+        }
+    }
+
+    #[test]
+    fn common_event_claim_is_single_releasable_and_cascade_safe() {
+        let db = Arc::new(Db::open(":memory:").unwrap());
+        let node_id =
+            db.create_node(&Node { name: "event-node".into(), ..Node::default() }, "event-token").unwrap();
+        db.enqueue_common_event("event-1", "traffic", Some(node_id), "2026-09-01", 5, "{}", 100).unwrap();
+
+        let gate = Arc::new(Barrier::new(3));
+        let claims = (0..2)
+            .map(|_| {
+                let db = Arc::clone(&db);
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    gate.wait();
+                    db.claim_common_event("event-1", 100, 600).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        gate.wait();
+        assert_eq!(
+            claims.into_iter().filter_map(|handle| handle.join().ok()).filter(|claimed| *claimed).count(),
+            1
+        );
+
+        db.release_common_event("event-1").unwrap();
+        assert!(db.claim_common_event("event-1", 101, 600).unwrap());
+        assert!(!db.claim_common_event("event-1", 102, 600).unwrap());
+        db.complete_common_event("event-1", 103).unwrap();
+        assert!(!db.claim_common_event("event-1", 1_000, 600).unwrap());
+
+        db.enqueue_common_event("event-2", "renew", Some(node_id), "2026-09-25", 0, "", 100).unwrap();
+        db.delete_node(node_id).unwrap();
+        assert!(db.pending_common_events("renew").unwrap().is_empty());
+    }
+
+    #[test]
+    fn completed_common_events_are_pruned_but_pending_events_are_kept() {
+        let db = Db::open(":memory:").unwrap();
+        let now = Utc::now().timestamp();
+        db.enqueue_common_event("old", "login", None, "", 0, "{}", now - 40 * 86_400).unwrap();
+        db.complete_common_event("old", now - 31 * 86_400).unwrap();
+        db.enqueue_common_event("recent", "login", None, "", 0, "{}", now).unwrap();
+        db.complete_common_event("recent", now).unwrap();
+        db.enqueue_common_event("pending", "login", None, "", 0, "{}", now - 40 * 86_400).unwrap();
+
+        assert_eq!(db.prune(30).unwrap(), 1);
+        let count = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM common_notification_event", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn deleting_a_stale_event_allows_the_same_deterministic_id_to_be_requeued() {
+        let db = Db::open(":memory:").unwrap();
+        db.enqueue_common_event("traffic-id", "traffic", None, "period", 5, "{}", 1).unwrap();
+        assert!(db.claim_common_event("traffic-id", 2, 600).unwrap());
+        db.delete_common_event("traffic-id").unwrap();
+        assert!(db.pending_common_events("traffic").unwrap().is_empty());
+        assert!(db.enqueue_common_event("traffic-id", "traffic", None, "period", 5, "{}", 3).unwrap());
     }
 }

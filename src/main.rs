@@ -7,6 +7,7 @@
 mod agent_ws;
 mod api;
 mod auth;
+mod common_notification;
 mod db;
 mod frontend;
 mod load_notification;
@@ -23,7 +24,7 @@ use axum::http::{header, Extensions, HeaderMap, StatusCode, Version};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
-use chrono::{Local, Months, NaiveDate};
+use chrono::{FixedOffset, Months, NaiveDate, Utc};
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tower_http::compression::Predicate;
@@ -64,6 +65,9 @@ pub struct App {
     /// Evaluates resource-load rules from durable minute history and delivers
     /// Telegram alerts without sharing connection lifecycle state.
     pub load_notifications: load_notification::LoadNotificationManager,
+    /// Handles billing, traffic and administrator login notifications through
+    /// their own durable outbox.
+    pub common_notifications: common_notification::CommonNotificationManager,
     /// Public base URL when `--site` was given, empty otherwise -- the
     /// default, where the hub is reached at whatever ip:port the browser used
     /// and the panel falls back to its own origin. Behind a reverse proxy it
@@ -97,6 +101,7 @@ impl App {
                 .expect("telegram http client"),
             notifications: notification::NotificationManager::default(),
             load_notifications: load_notification::LoadNotificationManager::default(),
+            common_notifications: common_notification::CommonNotificationManager::default(),
             site,
             themes,
             local_dev_provisioning,
@@ -330,6 +335,7 @@ async fn main() -> Result<()> {
         Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes, local_dev_provisioning));
     app.notifications.resume_pending(app.clone()).await;
     app.load_notifications.start(app.clone());
+    app.common_notifications.start(app.clone());
     let url = advertised_url(&args.site, args.listen);
     first_run(&app, &url)?;
     if exposed_over_plain_http(&url) {
@@ -410,6 +416,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/notification/settings",
             get(api::notification_settings).put(api::save_notification_settings),
+        )
+        .route(
+            "/api/notification/general",
+            get(api::general_notification_settings).put(api::save_general_notification_settings),
         )
         .route("/api/notification/telegram/test", post(api::test_telegram))
         .route(
@@ -610,12 +620,25 @@ fn renewed(expires: NaiveDate, cycle: &str, today: NaiveDate) -> Option<NaiveDat
     (next != expires).then_some(next)
 }
 
-fn renew_online_nodes(app: &App) -> Result<()> {
-    // The hub's timezone, as with the traffic boundaries: an expiry date is a
-    // date a person wrote down, and on a CST hub `Utc` answers "yesterday"
-    // until 08:00, while the panel beside it already says it has expired.
-    let today = Local::now().date_naive();
-    let online: Vec<i64> = app.agents.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
+#[derive(Debug, Clone)]
+struct RenewedNode {
+    name: String,
+    expires_at: String,
+}
+
+fn beijing_today() -> NaiveDate {
+    let offset = FixedOffset::east_opt(8 * 3_600).expect("UTC+8 is a valid fixed offset");
+    Utc::now().with_timezone(&offset).date_naive()
+}
+
+fn renew_online_nodes(app: &App) -> Result<Vec<RenewedNode>> {
+    // An expiry date is a date a person wrote down. Use the same UTC+8 day
+    // that appears in the notification template rather than the host's zone.
+    let today = beijing_today();
+    let online: std::collections::HashSet<i64> =
+        app.agents.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
+    let renew_notifications = common_notification::config(app);
+    let mut renewed_nodes = Vec::new();
     for node in app.db.nodes()? {
         if !online.contains(&node.id) {
             continue;
@@ -624,10 +647,18 @@ fn renew_online_nodes(app: &App) -> Result<()> {
             continue;
         };
         let Some(next) = renewed(expires, &node.billing_cycle, today) else { continue };
-        app.db.set_expiry(node.id, &next.to_string())?;
-        info!("node {} is still up past {expires}, expiry rolled to {next}", node.name);
+        let next = next.to_string();
+        if app.db.set_expiry_and_enqueue_renew_event(
+            node.id,
+            &next,
+            Utc::now().timestamp(),
+            renew_notifications.global_enabled && renew_notifications.renew_enabled,
+        )? {
+            info!("node {} is still up past {expires}, expiry rolled to {next}", node.name);
+            renewed_nodes.push(RenewedNode { name: node.name, expires_at: next });
+        }
     }
-    Ok(())
+    Ok(renewed_nodes)
 }
 
 /// Expires sessions, trims history and rolls over expiry dates once an hour.
@@ -642,9 +673,15 @@ async fn housekeeping(app: Shared) {
         if let Err(e) = app.db.expire_sessions() {
             warn!("expiring sessions failed: {e:#}");
         }
-        if let Err(e) = renew_online_nodes(&app) {
-            warn!("rolling expiry dates failed: {e:#}");
+        match renew_online_nodes(&app) {
+            Ok(nodes) => {
+                for node in nodes {
+                    info!("renewal notification queued for {} through {}", node.name, node.expires_at);
+                }
+            }
+            Err(e) => warn!("rolling expiry dates failed: {e:#}"),
         }
+        app.common_notifications.run_once(app.clone()).await;
     }
 }
 

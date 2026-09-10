@@ -5,7 +5,7 @@ import { toast } from "sonner"
 
 import { Cost } from "@/components/Cost"
 import { LoadNotification } from "@/components/LoadNotification"
-import { NotificationPlaceholder, NotificationSettings, OfflineNotificationSettings } from "@/components/Notification"
+import { CommonNotificationSettings, NotificationSettings, OfflineNotificationSettings } from "@/components/Notification"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
@@ -1240,7 +1240,21 @@ function SettingsTab() {
 
 // The two ways into this panel, on their own page: the GitHub identity it
 // trusts and the password that still works when GitHub does not.
-type Session = { id: string; current: boolean; created_at: number }
+type Session = {
+  id: string
+  current: boolean
+  created_at: number
+  expires_at: number
+  login_ip: string
+  auth_method: string
+  user_agent: string
+}
+
+function sessionAuthLabel(method: string) {
+  if (method === "github") return "GitHub"
+  if (method === "password") return "应急密码"
+  return method === "system" ? "系统" : "未知"
+}
 
 function Sessions() {
   const [rows, setRows] = useState<Session[] | null>(null)
@@ -1274,9 +1288,18 @@ function Sessions() {
       <div className="divide-y">
         {rows.map((s) => (
           <div key={s.id} className="flex items-center justify-between gap-3 py-2.5 first:pt-0 last:pb-0">
-            <div className="flex min-w-0 items-center gap-2 text-sm">
-              <span className="tnum">{new Date(s.created_at * 1000).toLocaleString()}</span>
-              {s.current && <Badge variant="secondary">当前设备</Badge>}
+            <div className="min-w-0 space-y-1 text-sm">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="tnum">{new Date(s.created_at * 1000).toLocaleString()}</span>
+                <span className="tnum text-muted-foreground">IP：{s.login_ip || "未知"}</span>
+                <Badge variant="outline">{sessionAuthLabel(s.auth_method)}</Badge>
+                {s.current && <Badge variant="secondary">当前设备</Badge>}
+              </div>
+              {s.user_agent && (
+                <p className="max-w-2xl truncate text-xs text-muted-foreground" title={s.user_agent}>
+                  UA：{s.user_agent}
+                </p>
+              )}
             </div>
             {/* 当前会话没有删除按钮：右上角的退出登录做的就是这件事，而在这里删
                 只会让已经渲染好的面板以为自己还登着。 */}
@@ -1660,7 +1683,7 @@ export function Admin({
         ) : path === "/admin/notification/load" ? (
           <LoadNotification nodes={nodes} />
         ) : path === "/admin/notification/general" ? (
-          <NotificationPlaceholder title="通用" />
+          <CommonNotificationSettings />
         ) : path === "/admin/cost" ? (
           <Cost nodes={nodes} />
         ) : path === "/admin/ping" ? (

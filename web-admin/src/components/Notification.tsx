@@ -3,9 +3,12 @@ import { Send } from "lucide-react"
 import { toast } from "sonner"
 
 import {
+  getCommonNotificationSettings,
   getNotificationSettings,
+  saveCommonNotificationSettings,
   saveNotificationSettings,
   sendTelegramTest,
+  type CommonNotificationSettings as CommonNotificationSettingsData,
   type Node,
   type NotificationSettings as NotificationSettingsData,
 } from "@/lib/api"
@@ -169,6 +172,204 @@ export function NotificationSettings() {
               </Button>
             </div>
           </form>
+        </div>
+      </Card>
+    </div>
+  )
+}
+
+export function CommonNotificationSettings() {
+  const [settings, setSettings] = useState<CommonNotificationSettingsData | null>(null)
+  const [renewEnabled, setRenewEnabled] = useState(false)
+  const [expiryEnabled, setExpiryEnabled] = useState(false)
+  const [expiryLeadDays, setExpiryLeadDays] = useState("7")
+  const [expiryCheckTime, setExpiryCheckTime] = useState("00:00")
+  const [trafficEnabled, setTrafficEnabled] = useState(false)
+  const [trafficStartPercent, setTrafficStartPercent] = useState("80")
+  const [loginEnabled, setLoginEnabled] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState("")
+
+  useEffect(() => {
+    let active = true
+    getCommonNotificationSettings()
+      .then((next) => {
+        if (!active) return
+        setSettings(next)
+        setRenewEnabled(next.renew_enabled)
+        setExpiryEnabled(next.expiry_enabled)
+        setExpiryLeadDays(String(next.expiry_lead_days))
+        setExpiryCheckTime(next.expiry_check_time)
+        setTrafficEnabled(next.traffic_enabled)
+        setTrafficStartPercent(String(next.traffic_start_percent))
+        setLoginEnabled(next.login_enabled)
+        setError("")
+      })
+      .catch((reason: Error) => {
+        if (active) setError(reason.message || "通用通知设置加载失败")
+      })
+      .finally(() => {
+        if (active) setLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [])
+
+  async function save() {
+    const days = Number(expiryLeadDays.trim())
+    const trafficStartPercentValue = Number(trafficStartPercent.trim())
+    if (!Number.isInteger(days) || days < 0 || days > 365) {
+      toast.error("过期提醒提前天数必须是 0 到 365 之间的整数")
+      return
+    }
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(expiryCheckTime)) {
+      toast.error("到期提醒检查时间必须是 00:00 到 23:59 之间的有效时间")
+      return
+    }
+    if (!Number.isInteger(trafficStartPercentValue) || trafficStartPercentValue < 0 || trafficStartPercentValue > 100) {
+      toast.error("流量提醒起始比例必须是 0 到 100 之间的整数")
+      return
+    }
+    setSaving(true)
+    try {
+      const next = await saveCommonNotificationSettings({
+        renew_enabled: renewEnabled,
+        expiry_enabled: expiryEnabled,
+        expiry_lead_days: days,
+        expiry_check_time: expiryCheckTime,
+        traffic_enabled: trafficEnabled,
+        traffic_start_percent: trafficStartPercentValue,
+        login_enabled: loginEnabled,
+      })
+      setSettings(next)
+      setRenewEnabled(next.renew_enabled)
+      setExpiryEnabled(next.expiry_enabled)
+      setExpiryLeadDays(String(next.expiry_lead_days))
+      setExpiryCheckTime(next.expiry_check_time)
+      setTrafficEnabled(next.traffic_enabled)
+      setTrafficStartPercent(String(next.traffic_start_percent))
+      setLoginEnabled(next.login_enabled)
+      toast.success("通用通知设置已保存")
+    } catch (reason) {
+      toast.error(reason instanceof Error ? reason.message : "通用通知设置保存失败")
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (loading) return <p className="text-sm text-muted-foreground">加载通用通知设置…</p>
+  if (error) return <p className="text-sm text-destructive" role="alert">{error}</p>
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <h2 className="text-lg font-semibold">通用通知</h2>
+        <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
+          配置到期、流量用量和后台登录等通用事件。所有消息仍受“通知设置”中的全局 Telegram 开关控制。
+        </p>
+      </div>
+
+      {!settings?.global_enabled && (
+        <p className="rounded-md bg-muted px-3 py-2 text-sm text-muted-foreground">
+          当前全局通知开关已关闭，下面的规则会保存但不会发送 Telegram 消息。
+        </p>
+      )}
+
+      <Card className="gap-5 p-5">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <Label htmlFor="common-renew-enabled">在线过期自动顺延提醒</Label>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">在线节点过期并成功顺延日期后发送一次。</p>
+          </div>
+          <Switch id="common-renew-enabled" checked={renewEnabled} onCheckedChange={setRenewEnabled} disabled={saving} />
+        </div>
+
+        <div className="border-t pt-5">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <Label htmlFor="common-expiry-enabled">服务到期提醒</Label>
+              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">每天聚合发送一次，包含进入提醒范围且尚未到期的服务器。</p>
+            </div>
+            <Switch id="common-expiry-enabled" checked={expiryEnabled} onCheckedChange={setExpiryEnabled} disabled={saving} />
+          </div>
+          <div className="mt-4 max-w-xs space-y-2">
+            <Label htmlFor="common-expiry-lead-days">提前多少天开始提醒</Label>
+            <Input
+              id="common-expiry-lead-days"
+              type="number"
+              min={0}
+              max={365}
+              step={1}
+              value={expiryLeadDays}
+              onChange={(event) => setExpiryLeadDays(event.target.value)}
+              disabled={saving}
+            />
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              设置在到期前多少天开始发送提醒；范围 0–365 天，0 表示只在到期当天提醒；没有到期日的服务器不会提醒。
+            </p>
+          </div>
+
+          <div className="mt-4 max-w-xs space-y-2">
+            <Label htmlFor="common-expiry-check-time">每天检查时间（UTC+8）</Label>
+            <Input
+              id="common-expiry-check-time"
+              type="time"
+              step={60}
+              value={expiryCheckTime}
+              onChange={(event) => setExpiryCheckTime(event.target.value)}
+              disabled={saving}
+            />
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              每天到达该时间后检查一次并发送聚合提醒；服务晚于该时间启动会当天补查。
+            </p>
+          </div>
+        </div>
+
+        <div className="border-t pt-5">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <Label htmlFor="common-traffic-enabled">流量提醒</Label>
+              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                流量达到设定比例后发送通知，并按 5% 梯度持续提醒；使用比例按当前计费周期的有效额度计算。服务器未设置流量阈值时不发送通知；设置为 0 可关闭流量提醒。
+              </p>
+            </div>
+            <Switch id="common-traffic-enabled" checked={trafficEnabled} onCheckedChange={setTrafficEnabled} disabled={saving} />
+          </div>
+          <div className="mt-4 max-w-xs space-y-2">
+            <Label htmlFor="common-traffic-start-percent">首次提醒比例（0–100%）</Label>
+            <Input
+              id="common-traffic-start-percent"
+              type="number"
+              min={0}
+              max={100}
+              step={1}
+              value={trafficStartPercent}
+              onChange={(event) => setTrafficStartPercent(event.target.value)}
+              disabled={saving}
+              inputMode="numeric"
+            />
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              只有“流量提醒”开关开启且节点设置了有效流量额度时才会发送；比例为 0 时不会发送。
+            </p>
+          </div>
+        </div>
+
+        <div className="border-t pt-5">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <Label htmlFor="common-login-enabled">后台登录通知</Label>
+              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">密码或 GitHub 创建新的登录会话后发送，消息包含登录 IP 和登录方式。</p>
+            </div>
+            <Switch id="common-login-enabled" checked={loginEnabled} onCheckedChange={setLoginEnabled} disabled={saving} />
+          </div>
+        </div>
+
+        <div className="border-t pt-4">
+          <Button type="button" onClick={() => void save()} disabled={saving || !settings}>
+            {saving ? "保存中…" : "保存设置"}
+          </Button>
         </div>
       </Card>
     </div>

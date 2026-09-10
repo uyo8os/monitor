@@ -181,6 +181,39 @@ export function sendTelegramTest() {
   return api<{ ok: boolean }>("/notification/telegram/test", { method: "POST" })
 }
 
+export type CommonNotificationSettings = {
+  global_enabled: boolean
+  renew_enabled: boolean
+  expiry_enabled: boolean
+  expiry_lead_days: number
+  expiry_check_time: string
+  traffic_enabled: boolean
+  traffic_start_percent: number
+  traffic_step_percent: number
+  login_enabled: boolean
+}
+
+export type CommonNotificationSettingsPatch = {
+  renew_enabled?: boolean
+  expiry_enabled?: boolean
+  expiry_lead_days?: number
+  expiry_check_time?: string
+  traffic_enabled?: boolean
+  traffic_start_percent?: number
+  login_enabled?: boolean
+}
+
+export function getCommonNotificationSettings() {
+  return api<CommonNotificationSettings>("/notification/general")
+}
+
+export function saveCommonNotificationSettings(patch: CommonNotificationSettingsPatch) {
+  return api<CommonNotificationSettings>("/notification/general", {
+    method: "PUT",
+    body: JSON.stringify(patch),
+  })
+}
+
 export type LoadMetric = "cpu" | "ram" | "disk" | "net_in" | "net_out"
 
 export type LoadRuleNode = {

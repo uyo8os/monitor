@@ -141,18 +141,44 @@ pub fn current_session(headers: &HeaderMap) -> Option<String> {
     cookie_value(headers, COOKIE).map(|token| sha256(&token))
 }
 
-/// When a session with this expiry was issued. `issue_session` sets the expiry
-/// to the moment of issue plus `SESSION_DAYS`, so this is exact, not an
-/// estimate -- change one and the other follows.
-pub fn issued_at(expires_at: i64) -> i64 {
-    expires_at - SESSION_DAYS * 86_400
-}
-
 /// The request's headers decide the Secure flag when the hub has no `--site`;
 /// see `App::secure_cookies`.
 pub fn issue_session(app: &App, headers: &HeaderMap) -> Result<String> {
+    issue_session_with_metadata(app, headers, None, "system", false)
+}
+
+/// Issues a session and records the security metadata needed by the session
+/// page. Interactive sign-ins also create a durable login-notification event;
+/// administrative session replacement paths pass `notify_login=false`.
+pub fn issue_session_with_metadata(
+    app: &App,
+    headers: &HeaderMap,
+    login_ip: Option<IpAddr>,
+    auth_method: &str,
+    notify_login: bool,
+) -> Result<String> {
     let token = random_token();
-    app.db.create_session(&sha256(&token), Utc::now().timestamp() + SESSION_DAYS * 86_400)?;
+    let created_at = Utc::now().timestamp();
+    let expires_at = created_at + SESSION_DAYS * 86_400;
+    let login_ip = login_ip.map(|ip| ip.to_string()).unwrap_or_default();
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.chars().filter(|character| !character.is_control()).take(512).collect::<String>())
+        .unwrap_or_default();
+    let notify_login = notify_login && {
+        let config = crate::common_notification::config(app);
+        config.global_enabled && config.login_enabled
+    };
+    app.db.create_session_with_metadata(
+        &sha256(&token),
+        expires_at,
+        created_at,
+        &login_ip,
+        auth_method,
+        &user_agent,
+        notify_login,
+    )?;
     Ok(set_cookie(COOKIE, &token, SESSION_DAYS * 86_400, app.secure_cookies(headers)))
 }
 
@@ -183,7 +209,7 @@ pub async fn login(
         return (StatusCode::UNAUTHORIZED, "invalid password").into_response();
     }
     app.throttle.clear(ip);
-    match issue_session(&app, &headers) {
+    match issue_session_with_metadata(&app, &headers, Some(ip), "password", true) {
         Ok(cookie) => with_cookies(Json(serde_json::json!({"ok": true})), [cookie]),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -229,6 +255,7 @@ pub struct Callback {
 
 pub async fn github_callback(
     State(app): State<crate::Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Query(query): Query<Callback>,
 ) -> Response {
@@ -252,7 +279,8 @@ pub async fn github_callback(
     if let Err(e) = github_login(&app, code).await {
         return sign_in_failed(&app, &headers, &e.to_string());
     }
-    let session = match issue_session(&app, &headers) {
+    let ip = client_ip(&headers, peer.ip());
+    let session = match issue_session_with_metadata(&app, &headers, Some(ip), "github", true) {
         Ok(cookie) => cookie,
         Err(e) => return sign_in_failed(&app, &headers, &e.to_string()),
     };
@@ -570,5 +598,32 @@ mod tests {
         assert_eq!(client_ip(&forged, ip("2001:db8::5")), ip("2001:db8::5"));
         // No header at all: the peer, wherever it is.
         assert_eq!(client_ip(&HeaderMap::new(), ip("10.0.0.1")), ip("10.0.0.1"));
+    }
+}
+
+#[cfg(test)]
+mod session_metadata_tests {
+    use super::*;
+    use crate::db::Db;
+
+    #[test]
+    fn interactive_session_records_ip_method_user_agent_and_only_queues_when_enabled() {
+        let app = crate::App::for_test(Db::open(":memory:").unwrap());
+        app.db.set("notification_enabled", "on").unwrap();
+        app.db.set(crate::common_notification::LOGIN_ENABLED_KEY, "on").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::USER_AGENT, "browser/1".parse().unwrap());
+        let ip: IpAddr = "203.0.113.8".parse().unwrap();
+        issue_session_with_metadata(&app, &headers, Some(ip), "password", true).unwrap();
+        let session = app.db.sessions().unwrap().pop().unwrap();
+        assert_eq!(session.login_ip, "203.0.113.8");
+        assert_eq!(session.auth_method, "password");
+        assert_eq!(session.user_agent, "browser/1");
+        assert_eq!(app.db.pending_common_events("login").unwrap().len(), 1);
+
+        let disabled = crate::App::for_test(Db::open(":memory:").unwrap());
+        disabled.db.set(crate::common_notification::LOGIN_ENABLED_KEY, "on").unwrap();
+        issue_session_with_metadata(&disabled, &HeaderMap::new(), Some(ip), "github", true).unwrap();
+        assert!(disabled.db.pending_common_events("login").unwrap().is_empty());
     }
 }

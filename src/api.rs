@@ -16,7 +16,7 @@ use tracing::debug;
 
 use crate::agent_ws::Agent;
 use crate::auth::{
-    authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
+    authed, client_ip, current_session, hash_password, issue_session, random_token, with_cookies,
 };
 use crate::db::{LoadRule, LoadRuleNode, Node, NodePatch, PingTask, Traffic, TrafficPatch};
 use crate::{agent_ws, App, FxSnapshot, Shared};
@@ -445,6 +445,64 @@ pub async fn save_notification_settings(
     }
     app.notifications.refresh_exclusions(app.clone(), &excluded_node_ids);
     Json(notification_settings_json(&app)).into_response()
+}
+
+#[derive(Deserialize, Default)]
+pub struct GeneralNotificationSettingsInput {
+    renew_enabled: Option<bool>,
+    expiry_enabled: Option<bool>,
+    expiry_lead_days: Option<i64>,
+    expiry_check_time: Option<String>,
+    traffic_enabled: Option<bool>,
+    traffic_start_percent: Option<i64>,
+    login_enabled: Option<bool>,
+}
+
+pub async fn general_notification_settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
+    Json(crate::common_notification::settings_json(&app))
+}
+
+pub async fn save_general_notification_settings(
+    _: Admin,
+    State(app): State<Shared>,
+    Json(body): Json<GeneralNotificationSettingsInput>,
+) -> Response {
+    let current = crate::common_notification::config(&app);
+    let expiry_lead_days = body.expiry_lead_days.unwrap_or(current.expiry_lead_days);
+    if !(0..=crate::common_notification::MAX_EXPIRY_LEAD_DAYS).contains(&expiry_lead_days) {
+        return bad("过期提醒提前天数必须是 0 到 365 之间的整数");
+    }
+    let expiry_check_minutes = match body.expiry_check_time.as_deref() {
+        Some(value) => match crate::common_notification::parse_expiry_check_time(value) {
+            Some(minutes) => minutes,
+            None => return bad("到期提醒检查时间必须是 00:00 到 23:59 之间的有效时间"),
+        },
+        None => current.expiry_check_minutes,
+    };
+    let renew_enabled = body.renew_enabled.unwrap_or(current.renew_enabled);
+    let expiry_enabled = body.expiry_enabled.unwrap_or(current.expiry_enabled);
+    let traffic_enabled = body.traffic_enabled.unwrap_or(current.traffic_enabled);
+    let traffic_start_percent = body.traffic_start_percent.unwrap_or(current.traffic_start_percent);
+    if !(0..=crate::common_notification::MAX_TRAFFIC_START_PERCENT).contains(&traffic_start_percent) {
+        return bad("流量提醒起始比例必须是 0 到 100 之间的整数");
+    }
+    let login_enabled = body.login_enabled.unwrap_or(current.login_enabled);
+    let expiry_lead_days_text = expiry_lead_days.to_string();
+    let expiry_check_time_text = crate::common_notification::format_expiry_check_time(expiry_check_minutes);
+    let traffic_start_percent_text = traffic_start_percent.to_string();
+    let values = [
+        (crate::common_notification::RENEW_ENABLED_KEY, if renew_enabled { "on" } else { "off" }),
+        (crate::common_notification::EXPIRY_ENABLED_KEY, if expiry_enabled { "on" } else { "off" }),
+        (crate::common_notification::EXPIRY_LEAD_DAYS_KEY, expiry_lead_days_text.as_str()),
+        (crate::common_notification::EXPIRY_CHECK_TIME_KEY, expiry_check_time_text.as_str()),
+        (crate::common_notification::TRAFFIC_ENABLED_KEY, if traffic_enabled { "on" } else { "off" }),
+        (crate::common_notification::TRAFFIC_START_PERCENT_KEY, traffic_start_percent_text.as_str()),
+        (crate::common_notification::LOGIN_ENABLED_KEY, if login_enabled { "on" } else { "off" }),
+    ];
+    if let Err(error) = app.db.set_many(&values) {
+        return fail(error);
+    }
+    Json(crate::common_notification::settings_json(&app)).into_response()
 }
 
 /// The test deliberately uses the saved provider configuration directly. It
@@ -1683,6 +1741,10 @@ pub async fn db_restore(
         return bad(&format!("上传收齐了却取不到文件：{e}"));
     }
 
+    // Stop old evaluation and delivery tasks before the restored pages become
+    // visible. Their generation must never be allowed to complete or release
+    // an event in the replacement database.
+    app.common_notifications.invalidate_all();
     let outcome = restore(&app, &source).await;
     // SQLite writes a -wal and a -shm beside any file it opens in WAL mode,
     // and a plain copy of a running hub's database is exactly that. They go
@@ -1963,11 +2025,15 @@ pub async fn sessions(_: Admin, State(app): State<Shared>, headers: HeaderMap) -
     match app.db.sessions() {
         Ok(rows) => Json(
             rows.into_iter()
-                .map(|(hash, expires_at)| {
+                .map(|session| {
                     json!({
-                        "current": mine.as_deref() == Some(hash.as_str()),
-                        "created_at": issued_at(expires_at),
-                        "id": hash,
+                        "current": mine.as_deref() == Some(session.token_hash.as_str()),
+                        "created_at": session.created_at,
+                        "expires_at": session.expires_at,
+                        "login_ip": session.login_ip,
+                        "auth_method": session.auth_method,
+                        "user_agent": session.user_agent,
+                        "id": session.token_hash,
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -3062,6 +3128,86 @@ mod tests {
         delete_session(Admin, axum::extract::State(app.clone()), Path(sha256(&theirs))).await;
         assert!(!app.db.session_valid(&sha256(&theirs)), "the deleted device is signed out");
         assert!(app.db.session_valid(&sha256(&mine)), "and nobody else is");
+    }
+
+    #[tokio::test]
+    async fn anonymous_general_notification_and_session_requests_are_unauthorized() {
+        let app: Shared = std::sync::Arc::new(app());
+        let request = axum::http::Request::new(());
+        let (mut parts, _) = request.into_parts();
+        let result = Admin::from_request_parts(&mut parts, &app).await;
+        assert!(matches!(result, Err(StatusCode::UNAUTHORIZED)));
+    }
+
+    #[tokio::test]
+    async fn general_notification_settings_are_admin_only_and_round_trip() {
+        let app = std::sync::Arc::new(app());
+        let Json(initial) = general_notification_settings(Admin, State(app.clone())).await;
+        assert_eq!(initial["renew_enabled"], false);
+        assert_eq!(initial["expiry_check_time"], "00:00");
+        assert_eq!(initial["traffic_start_percent"], 80);
+        assert_eq!(initial["traffic_step_percent"], 5);
+
+        let response = save_general_notification_settings(
+            Admin,
+            State(app.clone()),
+            Json(GeneralNotificationSettingsInput {
+                renew_enabled: Some(true),
+                expiry_enabled: Some(true),
+                expiry_lead_days: Some(5),
+                expiry_check_time: Some("09:30".to_owned()),
+                traffic_enabled: Some(true),
+                traffic_start_percent: Some(80),
+                login_enabled: Some(true),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let Json(saved) = general_notification_settings(Admin, State(app.clone())).await;
+        assert_eq!(saved["renew_enabled"], true);
+        assert_eq!(saved["expiry_lead_days"], 5);
+        assert_eq!(saved["expiry_check_time"], "09:30");
+        assert_eq!(saved["traffic_start_percent"], 80);
+        assert_eq!(saved["login_enabled"], true);
+
+        let zero = save_general_notification_settings(
+            Admin,
+            State(app.clone()),
+            Json(GeneralNotificationSettingsInput { traffic_start_percent: Some(0), ..Default::default() }),
+        )
+        .await;
+        assert_eq!(zero.status(), StatusCode::OK);
+        let Json(zero_settings) = general_notification_settings(Admin, State(app.clone())).await;
+        assert_eq!(zero_settings["traffic_start_percent"], 0);
+
+        for value in ["24:00", "12:60"] {
+            let invalid_time = save_general_notification_settings(
+                Admin,
+                State(app.clone()),
+                Json(GeneralNotificationSettingsInput {
+                    expiry_check_time: Some(value.to_owned()),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(invalid_time.status(), StatusCode::BAD_REQUEST, "invalid time: {value}");
+        }
+
+        let invalid = save_general_notification_settings(
+            Admin,
+            State(app.clone()),
+            Json(GeneralNotificationSettingsInput { expiry_lead_days: Some(366), ..Default::default() }),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+        let invalid_traffic = save_general_notification_settings(
+            Admin,
+            State(app),
+            Json(GeneralNotificationSettingsInput { traffic_start_percent: Some(101), ..Default::default() }),
+        )
+        .await;
+        assert_eq!(invalid_traffic.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
