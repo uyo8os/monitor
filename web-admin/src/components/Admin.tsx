@@ -46,6 +46,14 @@ function copy(text: string) {
   )
 }
 
+const ADDRESS_DISPLAY_LENGTH = 16
+
+function compactAddress(address: string) {
+  const value = address.trim()
+  if (value.length <= ADDRESS_DISPLAY_LENGTH) return value
+  return `${value.slice(0, 10)}...${value.slice(-3)}`
+}
+
 // Every address a node has, each click-to-copy: pasting one into an ssh
 // command is the reason it is shown at all.
 function Addresses({ node }: { node: Node }) {
@@ -61,10 +69,11 @@ function Addresses({ node }: { node: Node }) {
           key={address}
           type="button"
           onClick={() => copy(address)}
-          title="点击复制"
+          title={`点击复制：${address}`}
+          aria-label={`复制地址 ${address}`}
           className="tnum group inline-flex items-center gap-1 text-sm hover:text-foreground"
         >
-          {address}
+          <span>{compactAddress(address)}</span>
           <Copy className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
         </button>
       ))}
