@@ -24,7 +24,7 @@ use crate::{agent_ws, App, FxSnapshot, Shared};
 /// The only upstream used for cost summaries. Keeping this URL in the hub
 /// prevents a browser-provided URL from turning the refresh button into an
 /// SSRF primitive.
-const FX_URL: &str = "https://api.frankfurter.app/latest?from=USD";
+const FX_URL: &str = "https://api.frankfurter.dev/v1/latest?base=USD";
 const FX_PROVIDER: &str = "Frankfurter";
 const FX_LATEST_MAX_AGE: i64 = 72 * 3_600;
 const FX_CACHED_MAX_AGE: i64 = 7 * 86_400;
