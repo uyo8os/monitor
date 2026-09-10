@@ -554,6 +554,41 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   )
 }
 
+function ExpiryInfo({ expiresAt }: { expiresAt: string | null }) {
+  if (!expiresAt) return <span className="text-sm">{FOREVER}</span>
+
+  const date = new Date(`${expiresAt}T23:59:59`)
+  if (Number.isNaN(date.getTime())) return <span className="text-sm">{expiresAt}</span>
+
+  const daysLeft = Math.ceil((date.getTime() - Date.now()) / 86_400_000)
+
+  let variant: "offline" | "soon" | "blue" | "secondary" = "secondary"
+  let label = ""
+
+  if (daysLeft < 0) {
+    variant = "offline"
+    label = "已过期"
+  } else if (daysLeft <= 7) {
+    variant = "offline"
+    label = `${daysLeft} 天内到期`
+  } else if (daysLeft <= 30) {
+    variant = "soon"
+    label = `${daysLeft} 天后到期`
+  } else {
+    variant = "blue"
+    label = `${daysLeft} 天后到期`
+  }
+
+  return (
+    <div className="flex flex-col items-start gap-1">
+      <span className="text-sm">{expiresAt}</span>
+      <Badge variant={variant as any} className="font-normal border-current/20">
+        {label}
+      </Badge>
+    </div>
+  )
+}
+
 function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh: () => void; site: string; canProvision: boolean }) {
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
@@ -719,7 +754,9 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                 <TableCell className="tnum text-sm">
                   {n.price > 0 ? money(n.price, n.currency) : "免费"}
                 </TableCell>
-                <TableCell className="text-sm">{n.expires_at || FOREVER}</TableCell>
+                <TableCell>
+                  <ExpiryInfo expiresAt={n.expires_at} />
+                </TableCell>
                 <TableCell className="text-right whitespace-nowrap">
                   <Button variant="ghost" size="icon" disabled={!canProvision} onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">
                     <Download />
