@@ -1668,7 +1668,7 @@ export function Admin({
   const notificationActive = NOTIFICATION_SECTIONS.some(({ path: to }) => path === to)
   const [notificationExpanded, setNotificationExpanded] = useState(notificationActive)
   const notificationOpen = notificationExpanded
-  const renderNotificationLinks = (collapseOnSelect: boolean) =>
+  const renderNotificationLinks = (mobile = false) =>
     NOTIFICATION_SECTIONS.map(({ path: childPath, label: childLabel, icon: ChildIcon }) => {
       const childActive = path === childPath
       return (
@@ -1676,16 +1676,26 @@ export function Admin({
           key={childPath}
           type="button"
           onClick={() => {
-            if (collapseOnSelect) setNotificationExpanded(false)
+            if (mobile) setNotificationExpanded(false)
             go(childPath)
           }}
           aria-current={childActive ? "page" : undefined}
-          className={`flex w-full shrink-0 items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors ${
-            childActive ? "bg-secondary font-medium" : "text-muted-foreground hover:bg-muted"
+          className={`flex min-w-0 shrink-0 items-center transition-all ${
+            mobile
+              ? "flex-col justify-center gap-1.5 rounded-lg px-1 py-2.5 text-xs"
+              : "w-full gap-2 rounded-md px-3 py-2 text-sm"
+          } ${
+            childActive
+              ? mobile
+                ? "bg-background font-medium text-foreground shadow-sm ring-1 ring-border"
+                : "bg-secondary font-medium"
+              : mobile
+                ? "text-muted-foreground hover:bg-background/70 hover:text-foreground"
+                : "text-muted-foreground hover:bg-muted"
           }`}
         >
-          <ChildIcon className="size-4" />
-          {childLabel}
+          <ChildIcon className={mobile ? "size-[18px]" : "size-4"} />
+          <span className="truncate">{childLabel}</span>
         </button>
       )
     })
@@ -1703,7 +1713,10 @@ export function Admin({
               <div key={to} className="contents">
                 <button
                   type="button"
-                  onClick={() => go(to)}
+                  onClick={() => {
+                    setNotificationExpanded(false)
+                    go(to)
+                  }}
                   aria-current={active ? "page" : undefined}
                   className={`flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors ${
                     active ? "bg-secondary font-medium" : "text-muted-foreground hover:bg-muted"
@@ -1742,7 +1755,12 @@ export function Admin({
           })}
         </div>
         {notificationOpen && (
-          <div id="notification-submenu" role="group" aria-label="通知子菜单" className="w-full min-w-0 border-l pl-3 md:hidden">
+          <div
+            id="notification-submenu"
+            role="group"
+            aria-label="通知子菜单"
+            className="mt-2 grid w-full min-w-0 grid-cols-4 gap-1 rounded-xl border bg-muted/50 p-1 shadow-sm animate-in fade-in slide-in-from-top-1 duration-150 md:hidden"
+          >
             {renderNotificationLinks(true)}
           </div>
         )}
