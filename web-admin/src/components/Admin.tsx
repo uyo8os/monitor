@@ -582,7 +582,7 @@ function ExpiryInfo({ expiresAt }: { expiresAt: string | null }) {
   return (
     <div className="flex flex-col items-start gap-1">
       <span className="text-sm">{expiresAt}</span>
-      <Badge variant={variant as any} className="font-normal border-current/20">
+      <Badge variant={variant as any} className="rounded-md font-normal border-current/20">
         {label}
       </Badge>
     </div>
@@ -731,7 +731,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                   <Addresses node={n} />
                 </TableCell>
                 <TableCell>
-                  <Badge variant={n.online ? "online" : "offline"} className="font-normal border-transparent">
+                  <Badge variant={n.online ? "online" : "offline"} className="rounded-md font-normal border-transparent">
                     {n.online ? "在线" : "离线"}
                   </Badge>
                   {!n.public && <Badge variant="outline" className="ml-1 font-normal">不公开</Badge>}
