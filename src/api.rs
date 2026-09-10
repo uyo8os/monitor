@@ -18,7 +18,7 @@ use crate::agent_ws::Agent;
 use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
 };
-use crate::db::{Node, NodePatch, PingTask, Traffic, TrafficPatch};
+use crate::db::{LoadRule, LoadRuleNode, Node, NodePatch, PingTask, Traffic, TrafficPatch};
 use crate::{agent_ws, App, FxSnapshot, Shared};
 
 /// The only upstream used for cost summaries. Keeping this URL in the hub
@@ -478,6 +478,195 @@ fn fail(e: impl std::fmt::Display) -> Response {
 
 fn bad(message: &str) -> Response {
     (StatusCode::BAD_REQUEST, message.to_owned()).into_response()
+}
+
+const MAX_LOAD_RULE_NAME_CHARS: usize = 128;
+const MAX_LOAD_RULE_TARGETS: usize = 10_000;
+
+fn default_load_rule_enabled() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+pub struct LoadRuleInput {
+    name: String,
+    metric: String,
+    threshold: f64,
+    ratio: f64,
+    interval_minutes: i64,
+    #[serde(default = "default_load_rule_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    default_enabled: bool,
+    #[serde(default)]
+    nodes: Vec<LoadRuleNode>,
+}
+
+#[derive(Deserialize)]
+pub struct LoadSilenceInput {
+    mode: String,
+}
+
+fn normalize_load_rule(input: LoadRuleInput) -> Result<LoadRule, String> {
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err("负载规则名称不能为空".to_owned());
+    }
+    if name.chars().count() > MAX_LOAD_RULE_NAME_CHARS || name.chars().any(|value| value.is_control()) {
+        return Err(format!("负载规则名称不能超过 {MAX_LOAD_RULE_NAME_CHARS} 个字符且不能包含控制字符"));
+    }
+
+    let metric = input.metric.trim().to_ascii_lowercase();
+    if !matches!(metric.as_str(), "cpu" | "ram" | "disk" | "net_in" | "net_out") {
+        return Err("监控项必须是 cpu、ram、disk、net_in 或 net_out".to_owned());
+    }
+    if !input.threshold.is_finite() || input.threshold < 0.0 {
+        return Err("阈值必须是非负有限数字".to_owned());
+    }
+    if matches!(metric.as_str(), "cpu" | "ram" | "disk") && input.threshold > 100.0 {
+        return Err("CPU、RAM、Disk 阈值必须在 0 到 100 之间".to_owned());
+    }
+    if !input.ratio.is_finite() || !(0.0 < input.ratio && input.ratio <= 1.0) {
+        return Err("时间占比必须大于 0 且不超过 1".to_owned());
+    }
+    if !(1..=240).contains(&input.interval_minutes) {
+        return Err("间隔必须是 1 到 240 分钟之间的整数".to_owned());
+    }
+    if input.nodes.len() > MAX_LOAD_RULE_TARGETS {
+        return Err(format!("关联服务器数量不能超过 {MAX_LOAD_RULE_TARGETS} 个"));
+    }
+
+    let mut seen = HashSet::with_capacity(input.nodes.len());
+    for target in &input.nodes {
+        if target.node_id <= 0 {
+            return Err("关联服务器 ID 必须是正数".to_owned());
+        }
+        if !seen.insert(target.node_id) {
+            return Err(format!("服务器 {} 被重复关联", target.node_id));
+        }
+    }
+
+    Ok(LoadRule {
+        id: 0,
+        name: name.to_owned(),
+        metric,
+        threshold: input.threshold,
+        ratio: input.ratio,
+        interval_minutes: input.interval_minutes,
+        enabled: input.enabled,
+        default_enabled: input.default_enabled,
+        revision: 1,
+        created_at: 0,
+        updated_at: 0,
+        nodes: input.nodes,
+    })
+}
+
+pub async fn load_notification_rules(_: Admin, State(app): State<Shared>) -> Response {
+    match tokio::task::spawn_blocking(move || app.db.load_rules()).await {
+        Ok(Ok(rules)) => Json(json!({"rules": rules})).into_response(),
+        Ok(Err(error)) => fail(error),
+        Err(error) => fail(error),
+    }
+}
+
+pub async fn create_load_notification_rule(
+    _: Admin,
+    State(app): State<Shared>,
+    body: Result<Json<LoadRuleInput>, JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else { return bad("invalid load rule") };
+    let rule = match normalize_load_rule(body) {
+        Ok(rule) => rule,
+        Err(message) => return bad(&message),
+    };
+    match tokio::task::spawn_blocking(move || app.db.create_load_rule(&rule)).await {
+        Ok(Ok(id)) => Json(json!({"id": id})).into_response(),
+        Ok(Err(error)) => fail(error),
+        Err(error) => fail(error),
+    }
+}
+
+pub async fn update_load_notification_rule(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(id): Path<i64>,
+    body: Result<Json<LoadRuleInput>, JsonRejection>,
+) -> Response {
+    if id <= 0 {
+        return bad("负载规则 ID 无效");
+    }
+    let Ok(Json(body)) = body else { return bad("invalid load rule") };
+    let rule = match normalize_load_rule(body) {
+        Ok(rule) => rule,
+        Err(message) => return bad(&message),
+    };
+    match tokio::task::spawn_blocking(move || app.db.update_load_rule(id, &rule)).await {
+        Ok(Ok(())) => Json(json!({"ok": true})).into_response(),
+        Ok(Err(error)) => fail(error),
+        Err(error) => fail(error),
+    }
+}
+
+pub async fn delete_load_notification_rule(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(id): Path<i64>,
+) -> Response {
+    if id <= 0 {
+        return bad("负载规则 ID 无效");
+    }
+    match tokio::task::spawn_blocking(move || app.db.delete_load_rule(id)).await {
+        Ok(Ok(())) => Json(json!({"ok": true})).into_response(),
+        Ok(Err(error)) => fail(error),
+        Err(error) => fail(error),
+    }
+}
+
+pub async fn current_load_alerts(_: Admin, State(app): State<Shared>) -> Response {
+    let now = Utc::now().timestamp();
+    match tokio::task::spawn_blocking(move || app.db.current_load_alerts(now)).await {
+        Ok(Ok(alerts)) => Json(json!({"alerts": alerts})).into_response(),
+        Ok(Err(error)) => fail(error),
+        Err(error) => fail(error),
+    }
+}
+
+pub async fn set_load_alert_silence(
+    _: Admin,
+    State(app): State<Shared>,
+    Path((rule_id, node_id)): Path<(i64, i64)>,
+    body: Result<Json<LoadSilenceInput>, JsonRejection>,
+) -> Response {
+    if rule_id <= 0 || node_id <= 0 {
+        return bad("负载规则或服务器 ID 无效");
+    }
+    let Ok(Json(body)) = body else { return bad("invalid silence mode") };
+    let mode = body.mode.trim().to_ascii_lowercase();
+    let now = Utc::now().timestamp();
+    let (silenced_until, silenced_forever) = match mode.as_str() {
+        "off" => (None, false),
+        "24h" => (Some(now.saturating_add(86_400)), false),
+        "3d" => (Some(now.saturating_add(3 * 86_400)), false),
+        "7d" => (Some(now.saturating_add(7 * 86_400)), false),
+        "forever" => (None, true),
+        _ => return bad("静默模式必须是 off、24h、3d、7d 或 forever"),
+    };
+    match tokio::task::spawn_blocking(move || {
+        app.db.set_load_alert_silence(rule_id, node_id, silenced_until, silenced_forever, now)
+    })
+    .await
+    {
+        Ok(Ok(())) => Json(json!({
+            "ok": true,
+            "mode": mode,
+            "silenced_until": silenced_until,
+            "silenced_forever": silenced_forever,
+        }))
+        .into_response(),
+        Ok(Err(error)) => bad(&error.to_string()),
+        Err(error) => fail(error),
+    }
 }
 
 // ---- read paths, shared between the panel and the public page ----

@@ -9,6 +9,7 @@ mod api;
 mod auth;
 mod db;
 mod frontend;
+mod load_notification;
 mod notification;
 
 use std::collections::HashMap;
@@ -60,6 +61,9 @@ pub struct App {
     pub telegram_http: reqwest::Client,
     /// Coordinates offline grace timers without holding the agent map lock.
     pub notifications: notification::NotificationManager,
+    /// Evaluates resource-load rules from durable minute history and delivers
+    /// Telegram alerts without sharing connection lifecycle state.
+    pub load_notifications: load_notification::LoadNotificationManager,
     /// Public base URL when `--site` was given, empty otherwise -- the
     /// default, where the hub is reached at whatever ip:port the browser used
     /// and the panel falls back to its own origin. Behind a reverse proxy it
@@ -92,6 +96,7 @@ impl App {
                 .build()
                 .expect("telegram http client"),
             notifications: notification::NotificationManager::default(),
+            load_notifications: load_notification::LoadNotificationManager::default(),
             site,
             themes,
             local_dev_provisioning,
@@ -324,6 +329,7 @@ async fn main() -> Result<()> {
     let app =
         Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes, local_dev_provisioning));
     app.notifications.resume_pending(app.clone()).await;
+    app.load_notifications.start(app.clone());
     let url = advertised_url(&args.site, args.listen);
     first_run(&app, &url)?;
     if exposed_over_plain_http(&url) {
@@ -406,6 +412,19 @@ async fn main() -> Result<()> {
             get(api::notification_settings).put(api::save_notification_settings),
         )
         .route("/api/notification/telegram/test", post(api::test_telegram))
+        .route(
+            "/api/notification/load/rules",
+            get(api::load_notification_rules).post(api::create_load_notification_rule),
+        )
+        .route(
+            "/api/notification/load/rules/{id}",
+            put(api::update_load_notification_rule).delete(api::delete_load_notification_rule),
+        )
+        .route("/api/notification/load/current", get(api::current_load_alerts))
+        .route(
+            "/api/notification/load/current/{rule_id}/{node_id}/silence",
+            post(api::set_load_alert_silence),
+        )
         .route("/api/themes", get(api::themes))
         .route("/api/themes/{short}", delete(api::delete_theme))
         .route("/api/themes/{short}/preview", get(api::theme_preview))
