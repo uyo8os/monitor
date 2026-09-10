@@ -696,7 +696,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                   <Addresses node={n} />
                 </TableCell>
                 <TableCell>
-                  <Badge variant={n.online ? "default" : "secondary"} className="font-normal">
+                  <Badge variant={n.online ? "online" : "offline"} className="font-normal border-transparent">
                     {n.online ? "在线" : "离线"}
                   </Badge>
                   {!n.public && <Badge variant="outline" className="ml-1 font-normal">不公开</Badge>}

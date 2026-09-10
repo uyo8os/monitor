@@ -69,7 +69,7 @@ const FX_STATUS_LABELS: Record<FxStatus, string> = {
 
 function statusVariant(status: CostStatus) {
   if (status === "expired" || status === "unconfigured") return "destructive" as const
-  if (status === "soon") return "outline" as const
+  if (status === "soon") return "soon" as const
   return "secondary" as const
 }
 

@@ -198,7 +198,7 @@ function ServerSelectorDialog({
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2 text-sm">
                     <span className="truncate">{node.name}</span>
-                    <Badge variant={node.online ? "default" : "outline"}>{node.online ? "在线" : "离线"}</Badge>
+                    <Badge variant={node.online ? "online" : "offline"} className="border-transparent">{node.online ? "在线" : "离线"}</Badge>
                   </div>
                   <span className="tnum text-xs text-muted-foreground">ID: {node.id}</span>
                 </div>
