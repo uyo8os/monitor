@@ -28,7 +28,13 @@ agent 在 [独立仓库](https://github.com/stqfdyr/agent)。后台在 `web-admi
 - 用现成的主流组件，但过重的宁可自己写
 - 除了已经定下来的，其它取舍问用户，别自己定
 - 面板新接口的签名里必须有 `_: Admin`；新的节点字段默认放 `node_view()` 的 `full` 分支
-- 新增匿名可达的路径，先说清它单次请求的上界（内存、占锁时长、出网字节）
+- 新增匿名可达的路径，先说清两个上界：**单次请求**的（内存、占锁时长、出网字节），和**同时能有
+  几个在飞**的。只有前者会漏掉真正的洞——`/api/nodes/{id}/metrics` 的单次上界（`PUBLIC_HOURS`）
+  写得清清楚楚，实测仍然能被一台机器 120 个并发请求把面板从 1 ms 拖到 2.8 s。三条这样的路径现在
+  各有一个闸门：`api::HISTORY_GATE`、`main::RELAY_GATE`、`auth::PASSWORD_GATE`
+- **加了闸门要实测它真的会拒绝。** 同步 handler 里的 permit 只在 worker 线程跑着它时被持有，所以
+  「在飞数」封顶就是核数：三核机器上闸门写 8 等于没写（实测 120 并发 0 拒绝）。重的 DB 查询要
+  `spawn_blocking`／`block_in_place` 挪出 runtime，permit 跨 await 持有，闸门才有意义
 
 ## 常用命令
 

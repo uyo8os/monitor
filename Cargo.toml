@@ -33,6 +33,9 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 
 [dev-dependencies]
 serde_urlencoded = "0.7"
+# Only the tests need a clock they can move: the relay deadline is minutes long.
+# dev-dependencies do not reach the shipped binary.
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 codegen-units = 1

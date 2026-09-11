@@ -157,12 +157,42 @@ pub fn proxied(app: &App, url: String) -> String {
 const RELAY_SLOTS: usize = 4;
 static RELAY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(RELAY_SLOTS);
 
+/// Longest a relay may hold its permit.
+///
+/// Generous: a node on a slow link still has to finish 1.8 MB. What it rules
+/// out is a transfer that never finishes at all.
+const RELAY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// Holds a relay permit until the last byte has gone out. The handler returns
 /// once the response head is built, so a permit dropped there would gate the
 /// fetch and leave the transfer -- the part that costs -- unbounded.
+///
+/// The permit is not in here, though, because "until the last byte" has no
+/// upper bound of its own: a client that stops reading leaves hyper unable to
+/// flush, hyper then stops polling this stream, and a deadline checked in
+/// `poll_next` would never be checked -- nor would the upstream timeout on the
+/// reqwest body, which is poll-driven too. Four connections that accept the
+/// response and never read it would hold all four slots for as long as they
+/// stayed open, and `/agent/{arch}` is how every node installs. So the permit
+/// goes to a task with a timer of its own, and this end of the channel --
+/// dropped with the body, whether it finished or the connection died -- is what
+/// tells that task to let go early.
 struct Metered<S> {
     inner: S,
-    _permit: tokio::sync::SemaphorePermit<'static>,
+    _done: tokio::sync::oneshot::Sender<()>,
+}
+
+/// Wraps `inner` and parks `permit` on a task that gives it back when the body
+/// is dropped or [`RELAY_DEADLINE`] passes, whichever comes first.
+fn metered<S>(inner: S, permit: tokio::sync::SemaphorePermit<'static>) -> Metered<S> {
+    let (_done, body_gone) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        // Both arms end the task, which is what drops the permit. `body_gone`
+        // resolves as an error the moment the sender goes, which is the signal.
+        let _permit = permit;
+        let _ = tokio::time::timeout(RELAY_DEADLINE, body_gone).await;
+    });
+    Metered { inner, _done }
 }
 
 impl<S: futures_core::Stream + Unpin> futures_core::Stream for Metered<S> {
@@ -206,7 +236,7 @@ async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Re
         // ceiling. Passing the bytes through costs one buffer per request.
         Ok(res) if res.status().is_success() => (
             [(header::CONTENT_TYPE, "application/octet-stream")],
-            axum::body::Body::from_stream(Metered { inner: Box::pin(res.bytes_stream()), _permit: permit }),
+            axum::body::Body::from_stream(metered(Box::pin(res.bytes_stream()), permit)),
         )
             .into_response(),
         Ok(res) => {
@@ -751,17 +781,33 @@ mod tests {
 
     /// The gate is worth nothing if the permit is released when the handler
     /// returns: the head is built in microseconds and the 1.8 MB behind it is
-    /// the cost. The permit has to live on the body.
-    #[test]
-    fn a_relay_permit_is_held_for_as_long_as_the_body_is() {
+    /// the cost. So the permit outlives the handler -- and, because "until the
+    /// last byte" is the client's decision, no longer than RELAY_DEADLINE.
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_permit_follows_the_body_but_not_past_the_deadline() {
         let queued: Vec<_> =
             (1..RELAY_SLOTS).map(|_| RELAY_GATE.try_acquire().expect("up to the limit")).collect();
-        let body = Metered { inner: Nothing, _permit: RELAY_GATE.try_acquire().expect("the last slot") };
-
+        let body = metered(Nothing, RELAY_GATE.try_acquire().expect("the last slot"));
+        tokio::task::yield_now().await;
         assert!(RELAY_GATE.try_acquire().is_err(), "the request past the limit must be refused");
+
+        // A body that ends -- or a connection that dies -- gives the slot back
+        // at once rather than waiting out the deadline.
         drop(body);
-        assert!(RELAY_GATE.try_acquire().is_ok(), "a finished download gives its slot back");
-        drop(queued);
+        tokio::task::yield_now().await;
+        let finished = RELAY_GATE.try_acquire().expect("a finished download gives its slot back");
+        drop(finished);
+
+        // And a client that accepts the response and then reads nothing never
+        // polls the body, so the body cannot be what times itself out. Only a
+        // timer that runs on its own can, which is why the permit is not on it.
+        let stalled = metered(Nothing, RELAY_GATE.try_acquire().expect("the last slot"));
+        tokio::task::yield_now().await;
+        assert!(RELAY_GATE.try_acquire().is_err());
+        tokio::time::advance(RELAY_DEADLINE + std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(RELAY_GATE.try_acquire().is_ok(), "a transfer that never finishes still gives its slot back");
+        drop((stalled, queued));
     }
 
     /// The proxy is a hub setting rather than an install-command argument, so

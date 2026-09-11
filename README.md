@@ -132,9 +132,12 @@ GitHub 代理（如 `https://ghfast.top`），hub 拉 release 时会用它，节
 > `install.sh` 直接安装，中间没有摘要校验。只填信得过的镜像。见
 > [docs/security.md](docs/security.md)。
 
-hub 只有明文 HTTP 时，命令里会多一个 `--insecure`——agent 和 `install.sh` 默认拒绝明文连远程 hub，
-因为凭证会明文传输，装 agent 下载的二进制也走同一条未验证的通道。面板会把这件事标出来。上了 TLS
-之后命令自动不再带它。
+**面板只从 HTTPS 域名生成安装命令。** 从 IP、回环或明文入口进来时，添加节点、批量窗口和安装命令
+一律不可用，面板会说明是哪一环没配好——因为 agent 和 `install.sh` 默认拒绝明文连远程 hub，凭证会
+明文传输，而装 agent 下载的二进制走的是同一条未验证的通道。
+
+确实要往一台没有 TLS 的 hub 上装，那就手工跑脚本并自己加 `--insecure`（见
+[docs/security.md](docs/security.md)）——面板不会替你拼这个参数。
 
 ## Docker
 
