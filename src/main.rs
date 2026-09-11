@@ -151,7 +151,7 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
 
 /// Where the agent binaries are published. Not a setting: anyone pointing this
 /// elsewhere is forking the project and already rebuilding this line.
-const AGENT_REPO: &str = "stqfdyr/agent";
+const AGENT_REPO: &str = "uyo8os/monitor-agent";
 
 /// The one-liner pasted onto a new VPS.
 async fn install_script() -> Response {
