@@ -1390,9 +1390,9 @@ impl Db {
     /// 27.52 GB the minutes hold. Averaged it is 28.02 GB, matching the
     /// accumulator.
     ///
-    /// `swap_used`, `tcp`, `udp` and `procs` are stored but not answered with
-    /// -- nothing draws them from history. The columns stay by the user's
-    /// call; `load1` was the fifth and is gone, see `migrate_to_2`.
+    /// All stored resource readings are answered with the history. Themes use
+    /// the connection and process series alongside CPU and network charts;
+    /// omitting them here silently turns those charts into a row of zeroes.
     ///
     /// The stamp is the bucket's start rather than a row inside it, so every
     /// series lands on one grid and the probe rows below can be shared.
@@ -1400,15 +1400,19 @@ impl Db {
         let conn = self.conn();
         let mut stmt = conn.prepare_cached(
             "SELECT (MIN(ts)/?3)*?3, AVG(cpu), CAST(AVG(mem_used) AS INTEGER),
-                    CAST(AVG(disk_used) AS INTEGER),
-                    CAST(AVG(net_rx) AS INTEGER), CAST(AVG(net_tx) AS INTEGER)
+                    CAST(AVG(swap_used) AS INTEGER), CAST(AVG(disk_used) AS INTEGER),
+                    CAST(AVG(net_rx) AS INTEGER), CAST(AVG(net_tx) AS INTEGER),
+                    CAST(AVG(tcp) AS INTEGER), CAST(AVG(udp) AS INTEGER),
+                    CAST(AVG(procs) AS INTEGER)
              FROM metric WHERE node_id=?1 AND ts>=?2 GROUP BY ts/?3 ORDER BY ts/?3",
         )?;
         let rows = stmt.query_map(params![node_id, since, step], |r| {
             Ok(serde_json::json!({
                 "ts": r.get::<_, i64>(0)?, "cpu": r.get::<_, f64>(1)?,
-                "mem_used": r.get::<_, i64>(2)?, "disk_used": r.get::<_, i64>(3)?,
-                "net_rx": r.get::<_, i64>(4)?, "net_tx": r.get::<_, i64>(5)?,
+                "mem_used": r.get::<_, i64>(2)?, "swap_used": r.get::<_, i64>(3)?,
+                "disk_used": r.get::<_, i64>(4)?, "net_rx": r.get::<_, i64>(5)?,
+                "net_tx": r.get::<_, i64>(6)?, "tcp": r.get::<_, i64>(7)?,
+                "udp": r.get::<_, i64>(8)?, "procs": r.get::<_, i64>(9)?,
             }))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)

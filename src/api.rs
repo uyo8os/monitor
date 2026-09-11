@@ -2562,8 +2562,18 @@ mod tests {
         let base = Utc::now().timestamp() / 120 * 120 - 120;
         // One bucket: a quiet minute and a busy one, then a probe that
         // answered once and timed out three times.
-        app.db.insert_metric(id, base + 10, &json!({"cpu": 0.0, "net_rx": 0})).unwrap();
-        app.db.insert_metric(id, base + 70, &json!({"cpu": 40.0, "net_rx": 1_000})).unwrap();
+        app.db.insert_metric(
+            id,
+            base + 10,
+            &json!({"cpu": 0.0, "net_rx": 0, "swap_used": 100, "tcp": 2, "udp": 4, "procs": 20}),
+        )
+        .unwrap();
+        app.db.insert_metric(
+            id,
+            base + 70,
+            &json!({"cpu": 40.0, "net_rx": 1_000, "swap_used": 200, "tcp": 4, "udp": 6, "procs": 40}),
+        )
+        .unwrap();
         for _ in 0..3 {
             task(&app, vec![id]);
         }
@@ -2578,6 +2588,10 @@ mod tests {
         let m = &app.db.metrics(id, base, 120).unwrap()[0];
         assert_eq!(m["cpu"], 20.0, "the bucket is its mean, not one row of it");
         assert_eq!(m["net_rx"], 500);
+        assert_eq!(m["swap_used"], 150);
+        assert_eq!(m["tcp"], 3);
+        assert_eq!(m["udp"], 5);
+        assert_eq!(m["procs"], 30);
         assert_eq!(m["ts"], base, "stamped with the bucket, so every series shares a grid");
 
         // By task, not by index: the rows share a timestamp, so `ORDER BY ts`
