@@ -254,7 +254,7 @@ function NodeForm({ node, onClose, onSaved }: {
             <Field label="分组" hint={'多个分组使用 ";" 隔开；会显示在公开页“全部节点”后。'}>
               <Input value={form.group} maxLength={512} onChange={(e) => set("group", e.target.value)} placeholder="自用;网站" />
             </Field>
-            <Field label="标签" className="sm:col-span-2">
+            <Field label="标签">
               <Input value={form.tags} maxLength={512} onChange={(e) => set("tags", e.target.value)} placeholder="1Gbps&lt;green&gt;;香港&lt;red&gt;" />
               <p className="text-xs leading-relaxed text-muted-foreground">
                 多个标签使用 “;” 隔开。<br />
