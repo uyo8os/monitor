@@ -45,7 +45,8 @@ cargo build --release
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/monitor-probe/monitor/main/install-hub.sh -o install-hub.sh
-sudo sh install-hub.sh
+chmod +x install-hub.sh
+sudo ./install-hub.sh
 ```
 
 有终端时给一个菜单（安装 / 升级、卸载、状态、日志）；`curl ... | sh` 没有终端可读答案，直接按默认装。
