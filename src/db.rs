@@ -98,6 +98,9 @@ CREATE TABLE IF NOT EXISTS node (
   billing_cycle TEXT    NOT NULL DEFAULT 'monthly',
   expires_at    TEXT,
   remark        TEXT    NOT NULL DEFAULT '',
+  -- Operator-supplied public metadata, consumed by status-page themes.
+  node_group    TEXT    NOT NULL DEFAULT '',
+  tags          TEXT    NOT NULL DEFAULT '',
   traffic_limit INTEGER NOT NULL DEFAULT 0,
   traffic_mode  TEXT    NOT NULL DEFAULT 'sum',
   traffic_reset_day INTEGER NOT NULL DEFAULT 1,
@@ -197,7 +200,7 @@ CREATE INDEX IF NOT EXISTS idx_common_notification_pending
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Bump it and add a `migrate_to_N` when the schema changes under a database
 /// that is already in service.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Adds a column that older databases lack. A duplicate column means the
 /// migration has already run; every other error is real and must propagate.
@@ -383,6 +386,13 @@ fn migrate_to_6(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Group names and tags are intentional public metadata. Keep their database
+/// names separate from SQL's GROUP keyword while retaining the API's `group`.
+fn migrate_to_7(conn: &Connection) -> Result<()> {
+    add_column(conn, "node", "node_group TEXT NOT NULL DEFAULT ''")?;
+    add_column(conn, "node", "tags TEXT NOT NULL DEFAULT ''")
+}
+
 /// Brings a database that is already in service up to `SCHEMA_VERSION` and
 /// stamps it. `from` is the version it is at now, so a fresh file passes
 /// `SCHEMA_VERSION` and only gets the stamp.
@@ -404,6 +414,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     migrate_to_4(conn)?;
     migrate_to_5(conn)?;
     migrate_to_6(conn)?;
+    if from < 7 {
+        migrate_to_7(conn)?;
+    }
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     Ok(())
 }
@@ -444,6 +457,12 @@ pub struct Node {
     pub expires_at: Option<String>,
     #[serde(default)]
     pub remark: String,
+    /// Public group membership. Multiple groups are separated by semicolons.
+    #[serde(default)]
+    pub group: String,
+    /// Public status-page labels. Multiple labels are separated by semicolons.
+    #[serde(default)]
+    pub tags: String,
     /// Monthly allowance in bytes; 0 means unmetered.
     #[serde(default)]
     pub traffic_limit: i64,
@@ -512,6 +531,8 @@ pub struct NodePatch {
     #[serde(default, deserialize_with = "expiry_patch")]
     pub expires_at: Option<Option<String>>,
     pub remark: Option<String>,
+    pub group: Option<String>,
+    pub tags: Option<String>,
     pub traffic_limit: Option<i64>,
     pub traffic_mode: Option<String>,
     pub traffic_reset_day: Option<u32>,
@@ -928,8 +949,8 @@ impl Db {
             // A new node belongs at the end. The caller sends sort 0, which
             // would tie with whatever the last reorder put first.
             "INSERT INTO node (name, token, sort, public, price, currency, billing_cycle,
-                               expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at)
-             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                               expires_at, remark, node_group, tags, traffic_limit, traffic_mode, traffic_reset_day, created_at)
+             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 n.name,
                 token,
@@ -939,6 +960,8 @@ impl Db {
                 n.billing_cycle,
                 n.expires_at,
                 n.remark,
+                n.group,
+                n.tags,
                 n.traffic_limit,
                 n.traffic_mode,
                 n.traffic_reset_day,
@@ -975,9 +998,10 @@ impl Db {
                              price=COALESCE(?5,price), currency=COALESCE(?6,currency),
                              billing_cycle=COALESCE(?7,billing_cycle),
                              expires_at=CASE WHEN ?8 THEN ?9 ELSE expires_at END,
-                             remark=COALESCE(?10,remark), traffic_limit=COALESCE(?11,traffic_limit),
-                             traffic_mode=COALESCE(?12,traffic_mode),
-                             traffic_reset_day=COALESCE(?13,traffic_reset_day)
+                             remark=COALESCE(?10,remark), node_group=COALESCE(?11,node_group),
+                             tags=COALESCE(?12,tags), traffic_limit=COALESCE(?13,traffic_limit),
+                             traffic_mode=COALESCE(?14,traffic_mode),
+                             traffic_reset_day=COALESCE(?15,traffic_reset_day)
              WHERE id=?1",
             params![
                 id,
@@ -990,6 +1014,8 @@ impl Db {
                 n.expires_at.is_some(),
                 n.expires_at.as_ref().and_then(|v| v.as_deref()),
                 n.remark,
+                n.group,
+                n.tags,
                 n.traffic_limit,
                 n.traffic_mode,
                 n.traffic_reset_day
@@ -2662,6 +2688,8 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         billing_cycle: s("billing_cycle"),
         expires_at: r.get::<_, Option<String>>("expires_at").unwrap_or(None),
         remark: s("remark"),
+        group: s("node_group"),
+        tags: s("tags"),
         traffic_limit: n("traffic_limit"),
         traffic_mode: s("traffic_mode"),
         traffic_reset_day: n("traffic_reset_day") as u32,
@@ -3702,8 +3730,8 @@ mod common_notification_db_tests {
     use super::*;
 
     #[test]
-    fn schema_v6_migrates_old_sessions_and_keeps_new_metadata_atomic() {
-        let path = std::env::temp_dir().join(format!("monitor-schema-v6-{}.db", rand::random::<u64>()));
+    fn schema_v7_migrates_old_sessions_and_keeps_new_metadata_atomic() {
+        let path = std::env::temp_dir().join(format!("monitor-schema-v7-{}.db", rand::random::<u64>()));
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
@@ -3714,10 +3742,17 @@ mod common_notification_db_tests {
         }
 
         let db = Db::open(path.to_str().unwrap()).unwrap();
-        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 6);
+        assert_eq!(
+            db.conn().query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(),
+            SCHEMA_VERSION
+        );
         let columns = columns_of(&db.conn(), "session").unwrap();
         for column in ["created_at", "login_ip", "auth_method", "user_agent"] {
             assert!(columns.contains(column), "missing migrated session column {column}");
+        }
+        let node_columns = columns_of(&db.conn(), "node").unwrap();
+        for column in ["node_group", "tags"] {
+            assert!(node_columns.contains(column), "missing migrated node column {column}");
         }
 
         let now = Utc::now().timestamp();

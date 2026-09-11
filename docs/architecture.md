@@ -85,7 +85,7 @@ agent 收到后会**保留没变化的任务**（同 id + 同 target + 同 inter
 | 表 | 作用 | 注意 |
 |---|---|---|
 | `setting` | key/value 配置 | 替代配置文件。见下方设置键列表 |
-| `node` | 节点配置 + agent 上报的静态信息 | `token` 存明文，面板要能重新显示安装命令；只在 `full` 视图输出。`country` 是 hub 从 `ip` 查来的两字母国家码，**公开**，见 [decisions.md](decisions.md) |
+| `node` | 节点配置 + agent 上报的静态信息 | `token` 存明文，面板要能重新显示安装命令；只在 `full` 视图输出。`country` 是 hub 从 `ip` 查来的两字母国家码；运营者填写的 `node_group` / `tags` 是状态页分组和标签，三者均**公开**，见 [decisions.md](decisions.md) |
 | `traffic` | **单调递增的流量累计** | 1:1 于 node，但生命周期完全不同（每次上报都写） |
 | `metric` | 历史明细，**每节点每分钟一行** | `WITHOUT ROWID`，按保留天数定期删。**一行描述它前面那一分钟，不是它那一瞬**：`net_rx/net_tx` 从累计器差值算出，`cpu`/`mem_used`/`disk_used`/`swap_used`/`tcp`/`udp`/`procs` 是分钟内均值。见 [decisions.md](decisions.md) |
 | `ping_task` / `ping_node` | 探测任务及其节点分配 | 多对多 |

@@ -185,6 +185,8 @@ function NodeForm({ node, onClose, onSaved }: {
       name: form.name.trim(),
       public: form.public,
       remark: form.remark,
+      group: form.group,
+      tags: form.tags,
       traffic_mode: form.traffic_mode,
       traffic_limit: Math.round(Number(limitGib) * GIB),
       traffic_reset_day: Math.min(31, Math.max(1, Math.round(Number(form.traffic_reset_day) || 1))),
@@ -246,6 +248,19 @@ function NodeForm({ node, onClose, onSaved }: {
             </Field>
             <Field label="备注" hint="仅管理员可见">
               <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="商家、用途" />
+            </Field>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="分组" hint={'多个分组使用 ";" 隔开；会显示在公开页“全部节点”后。'}>
+              <Input value={form.group} maxLength={512} onChange={(e) => set("group", e.target.value)} placeholder="自用;网站" />
+            </Field>
+            <Field label="标签" className="sm:col-span-2">
+              <Input value={form.tags} maxLength={512} onChange={(e) => set("tags", e.target.value)} placeholder="1Gbps&lt;green&gt;;香港&lt;red&gt;" />
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                多个标签使用 “;” 隔开。<br />
+                如需指定颜色，请在标签末尾添加 &lt;color&gt;，例如：1Gbps&lt;green&gt;。<br />
+                可用的颜色列表请参考：<a className="underline underline-offset-2 hover:text-foreground" href="https://www.radix-ui.com/themes/docs/theme/color" target="_blank" rel="noreferrer">Color – Radix Themes</a>
+              </p>
             </Field>
           </div>
           <details className="rounded-lg border bg-muted/30 px-3 py-2.5">

@@ -766,6 +766,11 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         "country": node.country,
         "sort": node.sort,
         "public": node.public,
+        // The operator explicitly marks these as status-page metadata. Unlike
+        // remarks, they are safe to publish and themes use them for filters
+        // and badges.
+        "group": node.group,
+        "tags": node.tags,
         "online": current.is_some(),
         // The live entry while connected, the stored one after. Zero means
         // connected but not yet reporting, which is not a time, so it falls
@@ -1161,6 +1166,13 @@ fn node_limits(reset_day: Option<u32>, price: Option<f64>, limit: Option<i64>) -
     None
 }
 
+/// These values go to anonymous status-page visitors. Semicolons deliberately
+/// remain intact because themes use them as the group/tag separator; control
+/// characters do not belong in a one-line node field or a JSON snapshot.
+fn normalize_public_metadata(value: &mut String) {
+    *value = value.trim().chars().filter(|c| !c.is_control()).take(512).collect();
+}
+
 pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
     Json(json!({
         "authed": authed(&app, &headers),
@@ -1196,6 +1208,8 @@ pub async fn create_node(
         return bad(message);
     }
     node.name = node.name.trim().to_owned();
+    normalize_public_metadata(&mut node.group);
+    normalize_public_metadata(&mut node.tags);
     let token = random_token();
     match app.db.create_node(&node, &token) {
         // Usable straight away: the install command is readable from the node
@@ -1332,6 +1346,12 @@ pub async fn update_node(
         if name.is_empty() {
             return bad("name is required");
         }
+    }
+    if let Some(group) = &mut node.group {
+        normalize_public_metadata(group);
+    }
+    if let Some(tags) = &mut node.tags {
+        normalize_public_metadata(tags);
     }
     if let Some(message) = node_limits(node.traffic_reset_day, node.price, node.traffic_limit) {
         return bad(message);
@@ -2687,6 +2707,16 @@ mod tests {
         let app = app();
         let open = node(&app, "open", true);
         node(&app, "hidden", false);
+        app.db
+            .update_node(
+                open,
+                &NodePatch {
+                    group: Some("自用;网站".into()),
+                    tags: Some("1Gbps<green>;香港<red>".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9").unwrap();
 
         // A live report, so the public view has metrics to strip. `hostname`
@@ -2702,6 +2732,8 @@ mod tests {
         let public = visible_nodes(&app, false).unwrap();
         assert_eq!(public.len(), 1, "a node marked private must not be listed");
         assert_eq!(public[0]["name"], "open");
+        assert_eq!(public[0]["group"], "自用;网站");
+        assert_eq!(public[0]["tags"], "1Gbps<green>;香港<red>");
         // Handing the token out would let any visitor impersonate the node.
         for hidden in ["ip", "remark", "hostname", "token"] {
             assert!(public[0].get(hidden).is_none(), "{hidden} must not be public");

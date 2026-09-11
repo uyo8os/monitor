@@ -755,6 +755,8 @@ GitHub 挂了、OAuth App 配错了、被墙了，纯 SSO 会把人彻底锁在�
 **公开视图永远不输出 `ip`、`hostname`、`remark`**——`src/api.rs` 的 `node_view()` 里 `full=false`
 时这三个字段根本不写进 JSON。有测试守着。
 
+按用户要求，`node.group` 和 `node.tags` 是运营者在后台填写的状态页元数据，明确对公开视图输出：前者以分号分隔，供主题生成“全部节点”后的分组筛选；后者以分号分隔，可用 `<color>` 后缀指定 Radix Themes 颜色。它们不承载地址、主机名或备注等私密信息。
+
 ### 手写 OAuth，不用 oauth2 crate **[默认]**
 
 GitHub OAuth 就是两个 HTTP 请求。`oauth2` crate 带一堆用不上的 flow 和类型体操。手写约 40 行，state nonce 用 HttpOnly cookie 防 CSRF。

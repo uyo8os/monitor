@@ -59,6 +59,10 @@ export type Node = {
   ipv4?: string
   ipv6?: string
   remark?: string
+  /** Public status-page group membership; semicolon-separated. */
+  group: string
+  /** Public status-page labels; semicolon-separated and optionally color-coded. */
+  tags: string
   /** Panel only. Empty for nodes created before the hub kept a copy. */
   token?: string
 }
