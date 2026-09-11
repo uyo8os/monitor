@@ -282,6 +282,8 @@ pub(crate) async fn send_telegram_message(app: &App, text: &str) -> Result<(), &
     let url = reqwest::Url::parse(&format!("{endpoint}{token}/sendMessage"))
         .map_err(|_| "Telegram 请求地址无效")?;
     let form = [("chat_id", chat_id.as_str()), ("text", text), ("parse_mode", "HTML")];
+    let _permit =
+        app.telegram_send_slots.clone().acquire_owned().await.map_err(|_| "Telegram 发送队列已关闭")?;
     let response = app
         .telegram_http
         .post(url)
@@ -443,7 +445,7 @@ pub async fn save_notification_settings(
             missing.iter().map(i64::to_string).collect::<Vec<_>>().join(", ")
         ));
     }
-    app.notifications.refresh_exclusions(app.clone(), &excluded_node_ids);
+    app.notifications.refresh_settings(app.clone(), &excluded_node_ids);
     Json(notification_settings_json(&app)).into_response()
 }
 
@@ -1765,6 +1767,7 @@ pub async fn db_restore(
     // visible. Their generation must never be allowed to complete or release
     // an event in the replacement database.
     app.common_notifications.invalidate_all();
+    app.load_notifications.invalidate_all();
     let outcome = restore(&app, &source).await;
     // SQLite writes a -wal and a -shm beside any file it opens in WAL mode,
     // and a plain copy of a running hub's database is exactly that. They go

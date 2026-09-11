@@ -1,6 +1,6 @@
 # monitor
 
-Rust 服务器探针的 **hub**，功能只有四件事：看状态、看流量、看延迟、算成本。
+Rust 服务器探针的 **hub**：看状态、看流量、看延迟、算成本，并发送 Telegram 通知。
 
 agent 在 [独立仓库](https://github.com/stqfdyr/agent)。后台在 `web-admin/`；默认公开页主题在
 [monitor-theme-default](https://github.com/stqfdyr/monitor-theme-default)，**以发布好的
@@ -18,7 +18,7 @@ agent 在 [独立仓库](https://github.com/stqfdyr/agent)。后台在 `web-admi
 
 ## 明确不做的
 
-不要「顺手」加回来，想加先问用户：通知、远程 SSH、插件系统、ICMP/HTTP ping、agent 自动更新、跨平台 agent。
+不要「顺手」加回来，想加先问用户：远程 SSH、插件系统、ICMP/HTTP ping、agent 自动更新、跨平台 agent。
 
 ## 工作方式
 

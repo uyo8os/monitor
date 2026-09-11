@@ -812,7 +812,7 @@ export function LoadNotification({ nodes }: { nodes: Node[] }) {
         <button type="button" onClick={() => setTab("rules")} className={`border-b-2 px-3 py-2 text-sm transition-colors ${tab === "rules" ? "border-primary font-medium" : "border-transparent text-muted-foreground hover:text-foreground"}`}>
           告警配置
         </button>
-        <button type="button" onClick={() => setTab("alerts")} className={`border-b-2 px-3 py-2 text-sm transition-colors ${tab === "alerts" ? "border-primary font-medium" : "border-transparent text-muted-foreground hover:text-foreground"}`}>
+        <button type="button" onClick={() => { if (tab !== "alerts") { setAlertsLoading(true); setTab("alerts") } }} className={`border-b-2 px-3 py-2 text-sm transition-colors ${tab === "alerts" ? "border-primary font-medium" : "border-transparent text-muted-foreground hover:text-foreground"}`}>
           当前告警{alerts.length > 0 ? ` (${alerts.length})` : ""}
         </button>
         {tab === "alerts" && <Button type="button" size="icon-sm" variant="ghost" className="ml-auto" title="刷新当前告警" onClick={refreshAlerts} disabled={alertsLoading}><RefreshCw className={alertsLoading ? "animate-spin" : ""} /></Button>}

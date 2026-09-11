@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
-use crate::db::{CommonNotificationEvent, Node};
+use crate::db::{CommonNotificationEvent, DeliveryFailure, Node};
+use crate::notification::{TELEGRAM_RETRY_DELAYS_SECONDS, TELEGRAM_TOTAL_ATTEMPTS};
 use crate::{App, Shared};
 
 pub(crate) const RENEW_ENABLED_KEY: &str = "common_renew_enabled";
@@ -167,6 +168,19 @@ impl CommonNotificationManager {
             });
         }
     }
+
+    fn schedule_run(&self, app: Shared, generation: u64, retry_at: i64) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let wait = retry_at.saturating_sub(Utc::now().timestamp()).max(0) as u64;
+            if wait > 0 {
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+            }
+            if manager.is_current(generation) {
+                manager.run_once(app).await;
+            }
+        });
+    }
 }
 
 pub(crate) fn config(app: &App) -> CommonNotificationConfig {
@@ -276,11 +290,14 @@ fn traffic_bucket(percent: f64, start_percent: i64) -> Option<i64> {
     if start_percent <= 0 || percent < start_percent as f64 {
         return None;
     }
-    let first_bucket =
+    let first_grid_bucket =
         ((start_percent + TRAFFIC_STEP_PERCENT - 1) / TRAFFIC_STEP_PERCENT * TRAFFIC_STEP_PERCENT).min(100);
     let current_bucket =
         ((percent / TRAFFIC_STEP_PERCENT as f64).floor() as i64 * TRAFFIC_STEP_PERCENT).min(100);
-    Some(current_bucket.max(first_bucket))
+    // A custom threshold such as 83% must first say "83%", not claim the
+    // future 85% bucket was reached. Once the next grid point is real, normal
+    // five-percent reminders continue from there.
+    Some(if current_bucket < first_grid_bucket { start_percent } else { current_bucket })
 }
 
 fn prepare_events(app: &App) -> Result<Vec<PlannedEvent>> {
@@ -517,43 +534,74 @@ async fn deliver(manager: CommonNotificationManager, app: Shared, event: Planned
         }
     };
 
-    for attempt in 0..3 {
-        if !manager.is_current(generation) {
-            return;
-        }
-        if !event_allowed(config(&app), &event.kind) {
-            complete_event(&manager, &app, &event.id, generation).await;
-            return;
-        }
-        if event.kind == "traffic" {
-            match tokio::task::block_in_place(|| traffic_event_is_current(&app, &event)) {
-                Ok(true) => {}
-                Ok(false) => {
-                    discard_event(&manager, &app, &event.id, generation);
-                    return;
-                }
-                Err(error) => {
-                    warn!(event_id = %event.id, "revalidating common traffic notification failed: {error:#}");
-                    release_event(&manager, &app, &event.id, generation);
-                    return;
-                }
-            }
-        }
-        match crate::api::send_telegram_message(&app, &text).await {
-            Ok(()) => {
-                if manager.is_current(generation) {
-                    complete_event(&manager, &app, &event.id, generation).await;
-                }
+    if !manager.is_current(generation) {
+        return;
+    }
+    if !event_allowed(config(&app), &event.kind) {
+        complete_event(&manager, &app, &event.id, generation).await;
+        return;
+    }
+    if event.kind == "traffic" {
+        match tokio::task::block_in_place(|| traffic_event_is_current(&app, &event)) {
+            Ok(true) => {}
+            Ok(false) => {
+                discard_event(&manager, &app, &event.id, generation);
                 return;
-            }
-            Err(error) if attempt < 2 => {
-                debug!(event_id = %event.id, attempt = attempt + 1, "common notification send failed: {error}; retrying");
-                tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
             }
             Err(error) => {
-                warn!(event_id = %event.id, "common notification send failed: {error}");
+                warn!(event_id = %event.id, "revalidating common traffic notification failed: {error:#}");
                 release_event(&manager, &app, &event.id, generation);
                 return;
+            }
+        }
+    }
+    match crate::api::send_telegram_message(&app, &text).await {
+        Ok(()) => {
+            if manager.is_current(generation) {
+                complete_event(&manager, &app, &event.id, generation).await;
+            }
+        }
+        Err(error) => {
+            let outcome = if manager.is_current(generation) {
+                tokio::task::block_in_place(|| {
+                    app.db.record_common_event_failure(
+                        &event.id,
+                        Utc::now().timestamp(),
+                        error,
+                        &TELEGRAM_RETRY_DELAYS_SECONDS,
+                    )
+                })
+            } else {
+                return;
+            };
+            match outcome {
+                Ok(Some(DeliveryFailure::Retry { failure_count, retry_at })) => {
+                    warn!(
+                        event_id = %event.id,
+                        kind = %event.kind,
+                        node_id = ?event.node_id,
+                        failure_count,
+                        max_attempts = TELEGRAM_TOTAL_ATTEMPTS,
+                        retry_at,
+                        "common notification send failed: {error}; retry scheduled"
+                    );
+                    manager.schedule_run(app, generation, retry_at);
+                }
+                Ok(Some(DeliveryFailure::Abandoned { failure_count })) => warn!(
+                    event_id = %event.id,
+                    kind = %event.kind,
+                    node_id = ?event.node_id,
+                    failure_count,
+                    max_attempts = TELEGRAM_TOTAL_ATTEMPTS,
+                    "common notification marked failed and abandoned after retry limit: {error}"
+                ),
+                Ok(None) => debug!(event_id = %event.id, "stale common notification failure was ignored"),
+                Err(store_error) => warn!(
+                    event_id = %event.id,
+                    kind = %event.kind,
+                    node_id = ?event.node_id,
+                    "recording common notification failure failed: {store_error:#}; send error: {error}"
+                ),
             }
         }
     }
@@ -742,7 +790,9 @@ mod tests {
         assert_eq!(traffic_bucket(5.0, 5), Some(5));
         assert_eq!(traffic_bucket(79.99, 80), None);
         assert_eq!(traffic_bucket(80.0, 80), Some(80));
-        assert_eq!(traffic_bucket(84.0, 83), Some(85));
+        assert_eq!(traffic_bucket(83.0, 83), Some(83));
+        assert_eq!(traffic_bucket(84.0, 83), Some(83));
+        assert_eq!(traffic_bucket(85.0, 83), Some(85));
         assert_eq!(traffic_bucket(0.0, 0), None);
         assert_eq!(traffic_bucket(103.0, 80), Some(100));
     }

@@ -17,7 +17,7 @@
 
 ## 30 秒版本
 
-服务器探针的 hub。agent 在 [另一个仓库](https://github.com/stqfdyr/agent)。功能只有四件事：看状态、看流量、看延迟、算成本。
+服务器探针的 hub。agent 在 [另一个仓库](https://github.com/stqfdyr/agent)。负责状态、流量、延迟、成本与 Telegram 通知。
 
 - **agent** 只跑 Linux，直接读 `/proc` 和 `statvfs`，无状态、不落盘
 - **hub** 是 axum + SQLite，前端构建产物嵌进二进制，零配置文件启动
@@ -40,7 +40,6 @@
 
 **不要「顺手」加回来**：
 
-- 通知（离线告警、流量告警、任何形式的推送）
 - 远程 SSH / web terminal
 - 插件系统
 - ICMP ping 和 HTTP ping（只保留 TCP）

@@ -33,6 +33,8 @@ use tracing::{info, warn};
 use agent_ws::Agent;
 use db::Db;
 
+const TELEGRAM_SEND_SLOTS: usize = 4;
+
 pub type Shared = Arc<App>;
 
 pub(crate) struct FxSnapshot {
@@ -60,6 +62,10 @@ pub struct App {
     /// Telegram requests use a separate client so redirects can never move a
     /// bot token request away from the validated official endpoint.
     pub telegram_http: reqwest::Client,
+    /// One shared ceiling for every Telegram channel. Individual notification
+    /// managers may queue work, but no more than this many HTTP requests can
+    /// be in flight across lifecycle, load and common notifications together.
+    pub telegram_send_slots: Arc<tokio::sync::Semaphore>,
     /// Coordinates offline grace timers without holding the agent map lock.
     pub notifications: notification::NotificationManager,
     /// Evaluates resource-load rules from durable minute history and delivers
@@ -99,6 +105,7 @@ impl App {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("telegram http client"),
+            telegram_send_slots: Arc::new(tokio::sync::Semaphore::new(TELEGRAM_SEND_SLOTS)),
             notifications: notification::NotificationManager::default(),
             load_notifications: load_notification::LoadNotificationManager::default(),
             common_notifications: common_notification::CommonNotificationManager::default(),
@@ -334,6 +341,7 @@ async fn main() -> Result<()> {
     let app =
         Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes, local_dev_provisioning));
     app.notifications.resume_pending(app.clone()).await;
+    app.notifications.start(app.clone());
     app.load_notifications.start(app.clone());
     app.common_notifications.start(app.clone());
     let url = advertised_url(&args.site, args.listen);

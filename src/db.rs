@@ -14,6 +14,22 @@ use tracing::info;
 
 pub struct Db(Mutex<Connection>);
 
+pub struct PendingNotificationState {
+    pub node_id: i64,
+    pub pending_since: Option<i64>,
+    pub offline_confirmed: bool,
+    pub offline_notified: bool,
+    pub offline_attempts: i64,
+    pub offline_next_retry_at: Option<i64>,
+    pub offline_failed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryFailure {
+    Retry { failure_count: i64, retry_at: i64 },
+    Abandoned { failure_count: i64 },
+}
+
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -38,7 +54,11 @@ CREATE TABLE IF NOT EXISTS setting (
 CREATE TABLE IF NOT EXISTS notification_state (
   node_id INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
   pending_since INTEGER,
-  offline_confirmed INTEGER NOT NULL DEFAULT 0
+  offline_confirmed INTEGER NOT NULL DEFAULT 0,
+  offline_notified INTEGER NOT NULL DEFAULT 0,
+  offline_attempts INTEGER NOT NULL DEFAULT 0,
+  offline_next_retry_at INTEGER,
+  offline_failed INTEGER NOT NULL DEFAULT 0
 );
 
 -- Resource alert rules are separate from connection lifecycle notifications.
@@ -78,6 +98,10 @@ CREATE TABLE IF NOT EXISTS load_alert_state (
   silenced_until        INTEGER,
   silenced_forever      INTEGER NOT NULL DEFAULT 0,
   notification_claimed_at INTEGER,
+  notification_kind TEXT,
+  notification_attempts INTEGER NOT NULL DEFAULT 0,
+  notification_next_retry_at INTEGER,
+  notification_failed INTEGER NOT NULL DEFAULT 0,
   updated_at            INTEGER NOT NULL,
   PRIMARY KEY (rule_id, node_id)
 );
@@ -190,7 +214,11 @@ CREATE TABLE IF NOT EXISTS common_notification_event (
   payload TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   claimed_at INTEGER,
-  completed_at INTEGER
+  completed_at INTEGER,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_retry_at INTEGER,
+  failed_at INTEGER,
+  failure_reason TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_common_notification_pending
@@ -200,7 +228,7 @@ CREATE INDEX IF NOT EXISTS idx_common_notification_pending
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Bump it and add a `migrate_to_N` when the schema changes under a database
 /// that is already in service.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 9;
 
 /// Adds a column that older databases lack. A duplicate column means the
 /// migration has already run; every other error is real and must propagate.
@@ -304,7 +332,11 @@ fn migrate_to_4(conn: &Connection) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS notification_state (
            node_id INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
            pending_since INTEGER,
-           offline_confirmed INTEGER NOT NULL DEFAULT 0
+           offline_confirmed INTEGER NOT NULL DEFAULT 0,
+           offline_notified INTEGER NOT NULL DEFAULT 0,
+           offline_attempts INTEGER NOT NULL DEFAULT 0,
+           offline_next_retry_at INTEGER,
+           offline_failed INTEGER NOT NULL DEFAULT 0
          );",
     )?;
     Ok(())
@@ -346,6 +378,10 @@ fn migrate_to_5(conn: &Connection) -> Result<()> {
            silenced_until INTEGER,
            silenced_forever INTEGER NOT NULL DEFAULT 0,
            notification_claimed_at INTEGER,
+           notification_kind TEXT,
+           notification_attempts INTEGER NOT NULL DEFAULT 0,
+           notification_next_retry_at INTEGER,
+           notification_failed INTEGER NOT NULL DEFAULT 0,
            updated_at INTEGER NOT NULL,
            PRIMARY KEY (rule_id, node_id)
          );
@@ -378,7 +414,11 @@ fn migrate_to_6(conn: &Connection) -> Result<()> {
            payload TEXT NOT NULL DEFAULT '',
            created_at INTEGER NOT NULL,
            claimed_at INTEGER,
-           completed_at INTEGER
+           completed_at INTEGER,
+           attempts INTEGER NOT NULL DEFAULT 0,
+           next_retry_at INTEGER,
+           failed_at INTEGER,
+           failure_reason TEXT NOT NULL DEFAULT ''
          );
          CREATE INDEX IF NOT EXISTS idx_common_notification_pending
            ON common_notification_event(kind, completed_at, claimed_at);",
@@ -391,6 +431,45 @@ fn migrate_to_6(conn: &Connection) -> Result<()> {
 fn migrate_to_7(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "node_group TEXT NOT NULL DEFAULT ''")?;
     add_column(conn, "node", "tags TEXT NOT NULL DEFAULT ''")
+}
+
+/// Remembers whether the confirmed offline transition actually reached
+/// Telegram. Existing confirmed rows are treated as already delivered so an
+/// upgrade cannot replay an old outage.
+fn migrate_to_8(conn: &Connection) -> Result<()> {
+    add_column(conn, "notification_state", "offline_notified INTEGER NOT NULL DEFAULT 0")?;
+    conn.execute("UPDATE notification_state SET offline_notified=offline_confirmed", [])?;
+    Ok(())
+}
+
+/// Adds bounded retry bookkeeping to every durable Telegram notification.
+/// Existing undelivered rows are due immediately and start with a fresh retry
+/// budget; schema 7 lifecycle rows were already protected from replay by v8.
+fn migrate_to_9(conn: &Connection) -> Result<()> {
+    add_column(conn, "notification_state", "offline_attempts INTEGER NOT NULL DEFAULT 0")?;
+    add_column(conn, "notification_state", "offline_next_retry_at INTEGER")?;
+    add_column(conn, "notification_state", "offline_failed INTEGER NOT NULL DEFAULT 0")?;
+    add_column(conn, "load_alert_state", "notification_kind TEXT")?;
+    add_column(conn, "load_alert_state", "notification_attempts INTEGER NOT NULL DEFAULT 0")?;
+    add_column(conn, "load_alert_state", "notification_next_retry_at INTEGER")?;
+    add_column(conn, "load_alert_state", "notification_failed INTEGER NOT NULL DEFAULT 0")?;
+    add_column(conn, "common_notification_event", "attempts INTEGER NOT NULL DEFAULT 0")?;
+    add_column(conn, "common_notification_event", "next_retry_at INTEGER")?;
+    add_column(conn, "common_notification_event", "failed_at INTEGER")?;
+    add_column(conn, "common_notification_event", "failure_reason TEXT NOT NULL DEFAULT ''")?;
+    conn.execute_batch(
+        "UPDATE notification_state
+           SET offline_next_retry_at=CAST(strftime('%s', 'now') AS INTEGER)
+         WHERE offline_confirmed=1 AND offline_notified=0 AND offline_failed=0
+           AND offline_next_retry_at IS NULL;
+         UPDATE common_notification_event
+           SET next_retry_at=created_at
+         WHERE completed_at IS NULL AND failed_at IS NULL AND next_retry_at IS NULL;
+         UPDATE load_alert_state
+           SET notification_next_retry_at=COALESCE(notification_claimed_at, updated_at)
+         WHERE notification_claimed_at IS NOT NULL AND notification_next_retry_at IS NULL;",
+    )?;
+    Ok(())
 }
 
 /// Brings a database that is already in service up to `SCHEMA_VERSION` and
@@ -416,6 +495,12 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     migrate_to_6(conn)?;
     if from < 7 {
         migrate_to_7(conn)?;
+    }
+    if from < 8 {
+        migrate_to_8(conn)?;
+    }
+    if from < 9 {
+        migrate_to_9(conn)?;
     }
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     Ok(())
@@ -591,6 +676,8 @@ pub struct CommonNotificationEvent {
     pub period_key: String,
     pub bucket: i64,
     pub payload: String,
+    pub attempts: i64,
+    pub next_retry_at: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -843,9 +930,13 @@ impl Db {
     /// offline. The latter guard is the durable half of notification de-dup.
     pub fn mark_notification_pending(&self, node_id: i64, pending_since: i64) -> Result<bool> {
         let changed = self.conn().execute(
-            "INSERT INTO notification_state (node_id, pending_since, offline_confirmed)
-             VALUES (?1, ?2, 0)
-             ON CONFLICT(node_id) DO UPDATE SET pending_since=excluded.pending_since
+            "INSERT INTO notification_state
+               (node_id, pending_since, offline_confirmed, offline_notified,
+                offline_attempts, offline_next_retry_at, offline_failed)
+             VALUES (?1, ?2, 0, 0, 0, NULL, 0)
+             ON CONFLICT(node_id) DO UPDATE SET
+               pending_since=excluded.pending_since, offline_notified=0,
+               offline_attempts=0, offline_next_retry_at=NULL, offline_failed=0
              WHERE notification_state.offline_confirmed=0",
             params![node_id, pending_since],
         )?;
@@ -854,36 +945,51 @@ impl Db {
 
     /// Clears a pending transition when an agent reconnects or when the event
     /// is disabled. Returns whether a confirmed offline state was consumed.
-    pub fn take_notification_offline(&self, node_id: i64) -> Result<bool> {
+    pub fn take_notification_offline(&self, node_id: i64) -> Result<(bool, bool, bool)> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let confirmed: i64 = tx
+        let state: (i64, i64, i64) = tx
             .query_row(
-                "SELECT offline_confirmed FROM notification_state WHERE node_id=?1",
+                "SELECT offline_confirmed, offline_notified, offline_failed
+                 FROM notification_state WHERE node_id=?1",
                 [node_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?
-            .unwrap_or(0);
+            .unwrap_or((0, 0, 0));
         tx.execute(
             "UPDATE notification_state
-             SET pending_since=NULL, offline_confirmed=0
+             SET pending_since=NULL, offline_confirmed=0, offline_notified=0,
+                 offline_attempts=0, offline_next_retry_at=NULL, offline_failed=0
              WHERE node_id=?1",
             [node_id],
         )?;
         tx.commit()?;
-        Ok(confirmed != 0)
+        Ok((state.0 != 0, state.1 != 0, state.2 != 0))
     }
 
     /// Lists transitions that were pending when the hub last stopped. The
     /// notification manager resumes their timers before accepting connections.
-    pub fn pending_notification_states(&self) -> Result<Vec<(i64, i64)>> {
+    pub fn pending_notification_states(&self) -> Result<Vec<PendingNotificationState>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT node_id, pending_since FROM notification_state
-             WHERE pending_since IS NOT NULL AND offline_confirmed=0",
+            "SELECT node_id, pending_since, offline_confirmed, offline_notified,
+                    offline_attempts, offline_next_retry_at, offline_failed
+             FROM notification_state
+             WHERE (pending_since IS NOT NULL AND offline_confirmed=0)
+                OR (offline_confirmed=1 AND offline_notified=0 AND offline_failed=0)",
         )?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PendingNotificationState {
+                node_id: row.get(0)?,
+                pending_since: row.get(1)?,
+                offline_confirmed: row.get(2)?,
+                offline_notified: row.get(3)?,
+                offline_attempts: row.get(4)?,
+                offline_next_retry_at: row.get(5)?,
+                offline_failed: row.get(6)?,
+            })
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -891,13 +997,91 @@ impl Db {
     /// network request so a late timer or repeated teardown cannot duplicate
     /// an offline message.
     pub fn confirm_notification_offline(&self, node_id: i64, pending_since: i64) -> Result<bool> {
+        let now = Utc::now().timestamp();
         let changed = self.conn().execute(
             "UPDATE notification_state
-             SET pending_since=NULL, offline_confirmed=1
+             SET pending_since=NULL, offline_confirmed=1, offline_notified=0,
+                 offline_attempts=0, offline_next_retry_at=?3, offline_failed=0
              WHERE node_id=?1 AND pending_since=?2 AND offline_confirmed=0",
-            params![node_id, pending_since],
+            params![node_id, pending_since, now],
         )?;
         Ok(changed != 0)
+    }
+
+    /// Marks delivery only while the same node is still in the confirmed
+    /// offline state. Recovery consumes the confirmed transition regardless
+    /// of whether delivery succeeded or exhausted its retry budget.
+    pub fn mark_notification_offline_delivered(&self, node_id: i64) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE notification_state
+             SET offline_notified=1, offline_next_retry_at=NULL, offline_failed=0
+             WHERE node_id=?1 AND offline_confirmed=1 AND offline_notified=0",
+            [node_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn notification_offline_delivery_pending(&self, node_id: i64) -> bool {
+        self.conn()
+            .query_row(
+                "SELECT 1 FROM notification_state
+                 WHERE node_id=?1 AND offline_confirmed=1
+                   AND offline_notified=0 AND offline_failed=0",
+                [node_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    pub fn record_notification_offline_failure(
+        &self,
+        node_id: i64,
+        attempted_at: i64,
+        retry_delays: &[i64],
+    ) -> Result<Option<DeliveryFailure>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let Some(previous_attempts) = tx
+            .query_row(
+                "SELECT offline_attempts FROM notification_state
+                 WHERE node_id=?1 AND offline_confirmed=1
+                   AND offline_notified=0 AND offline_failed=0",
+                [node_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let failure_count = previous_attempts.saturating_add(1);
+        let outcome = if let Some(delay) = retry_delays.get((failure_count - 1) as usize) {
+            let retry_at = attempted_at.saturating_add(*delay);
+            tx.execute(
+                "UPDATE notification_state
+                 SET offline_attempts=?2, offline_next_retry_at=?3
+                 WHERE node_id=?1",
+                params![node_id, failure_count, retry_at],
+            )?;
+            DeliveryFailure::Retry { failure_count, retry_at }
+        } else {
+            tx.execute(
+                "UPDATE notification_state
+                 SET offline_attempts=?2, offline_next_retry_at=NULL, offline_failed=1
+                 WHERE node_id=?1",
+                params![node_id, failure_count],
+            )?;
+            DeliveryFailure::Abandoned { failure_count }
+        };
+        tx.commit()?;
+        Ok(Some(outcome))
+    }
+
+    pub fn clear_notification_states(&self) -> Result<()> {
+        self.conn().execute("DELETE FROM notification_state", [])?;
+        Ok(())
     }
 
     /// Drops a pending transition without turning it into a confirmed offline
@@ -1612,25 +1796,27 @@ impl Db {
     }
 
     pub fn load_alert_due(&self, rule_id: i64, node_id: i64, now: i64) -> Result<bool> {
-        let last: Option<i64> = self
+        let state: Option<(i64, Option<i64>, Option<i64>, bool)> = self
             .conn()
             .query_row(
-                "SELECT COALESCE(s.last_evaluated_at, 0)
+                "SELECT COALESCE(s.last_evaluated_at, 0), s.notification_next_retry_at,
+                        s.notification_claimed_at, COALESCE(s.notification_failed, 0)
                  FROM load_rule r
                  JOIN load_rule_node t ON t.rule_id=r.id AND t.node_id=?2 AND t.enabled=1
                  LEFT JOIN load_alert_state s ON s.rule_id=r.id AND s.node_id=t.node_id
                  WHERE r.id=?1 AND r.enabled=1",
                 params![rule_id, node_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        let Some(last) = last else { return Ok(false) };
+        let Some((last, next_retry_at, claimed_at, failed)) = state else { return Ok(false) };
         let interval: i64 = self.conn().query_row(
             "SELECT interval_minutes FROM load_rule WHERE id=?1",
             [rule_id],
             |row| row.get(0),
         )?;
-        Ok(last == 0 || now.saturating_sub(last) >= interval.saturating_mul(60))
+        let retry_due = !failed && claimed_at.is_none() && next_retry_at.is_some_and(|retry| retry <= now);
+        Ok(retry_due || last == 0 || now.saturating_sub(last) >= interval.saturating_mul(60))
     }
 
     pub fn load_metric_samples(&self, node_id: i64, since: i64, until: i64) -> Result<Vec<LoadMetricSample>> {
@@ -1699,10 +1885,25 @@ impl Db {
         if !enabled || stored_revision != revision {
             return Ok(None);
         }
-        let previous: Option<(bool, Option<i64>, Option<i64>, bool, Option<i64>, bool, Option<i64>)> = tx
+        let previous: Option<(
+            bool,
+            Option<i64>,
+            Option<i64>,
+            bool,
+            Option<i64>,
+            bool,
+            Option<i64>,
+            Option<String>,
+            i64,
+            Option<i64>,
+            bool,
+            i64,
+        )> = tx
             .query_row(
                 "SELECT alert_active, active_since, last_notified_at, recovery_pending,
-                        silenced_until, silenced_forever, notification_claimed_at
+                        silenced_until, silenced_forever, notification_claimed_at,
+                        notification_kind, notification_attempts,
+                        notification_next_retry_at, notification_failed, rule_revision
                  FROM load_alert_state WHERE rule_id=?1 AND node_id=?2",
                 params![rule_id, node_id],
                 |row| {
@@ -1714,6 +1915,11 @@ impl Db {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
                     ))
                 },
             )
@@ -1731,6 +1937,21 @@ impl Db {
             .is_some_and(|claimed| now.saturating_sub(claimed) >= interval.saturating_mul(120).max(300));
         let mut notification_claimed_at =
             if stale_claim { None } else { previous.as_ref().and_then(|state| state.6) };
+        let mut notification_kind = previous.as_ref().and_then(|state| state.7.clone());
+        let mut notification_attempts = previous.as_ref().map_or(0, |state| state.8);
+        let mut notification_next_retry_at = previous.as_ref().and_then(|state| state.9);
+        let mut notification_failed = previous.as_ref().is_some_and(|state| state.10);
+
+        if previous
+            .as_ref()
+            .is_some_and(|state| active != previous_active || state.11 != stored_revision)
+        {
+            notification_claimed_at = None;
+            notification_kind = None;
+            notification_attempts = 0;
+            notification_next_retry_at = None;
+            notification_failed = false;
+        }
 
         let active_since = if active {
             if previous_active {
@@ -1750,26 +1971,53 @@ impl Db {
             last_notified = None;
         }
 
-        let mut kind = None;
-        if notify && notification_claimed_at.is_none() && !silenced {
+        let mut candidate = None;
+        if !silenced {
             let cooldown = interval.saturating_mul(60);
             if active
                 && (last_notified.is_none() || now.saturating_sub(last_notified.unwrap_or(0)) >= cooldown)
             {
-                kind = Some(LoadNotificationKind::Alert);
-                notification_claimed_at = Some(now);
+                candidate = Some(LoadNotificationKind::Alert);
             } else if !active && recovery_pending {
-                kind = Some(LoadNotificationKind::Recovery);
+                candidate = Some(LoadNotificationKind::Recovery);
+            }
+        }
+        let mut kind = None;
+        if let Some(candidate_kind) = candidate {
+            let candidate_name = match candidate_kind {
+                LoadNotificationKind::Alert => "alert",
+                LoadNotificationKind::Recovery => "recovery",
+            };
+            if notify && notification_kind.as_deref() != Some(candidate_name) {
+                notification_kind = Some(candidate_name.to_owned());
+                notification_attempts = 0;
+                notification_next_retry_at = Some(now);
+                notification_failed = false;
+                notification_claimed_at = None;
+            }
+            if notify
+                && !notification_failed
+                && notification_claimed_at.is_none()
+                && notification_next_retry_at.is_none_or(|retry| retry <= now)
+            {
+                kind = Some(candidate_kind);
                 notification_claimed_at = Some(now);
             }
+        } else {
+            notification_claimed_at = None;
+            notification_kind = None;
+            notification_attempts = 0;
+            notification_next_retry_at = None;
+            notification_failed = false;
         }
         let latest_value = latest_value.unwrap_or(0.0);
         tx.execute(
             "INSERT INTO load_alert_state
              (rule_id,node_id,rule_revision,alert_active,active_since,last_evaluated_at,
               latest_value,matched_samples,total_samples,last_notified_at,recovery_pending,
-              silenced_until,silenced_forever,notification_claimed_at,updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?6)
+              silenced_until,silenced_forever,notification_claimed_at,notification_kind,
+              notification_attempts,notification_next_retry_at,notification_failed,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?6)
              ON CONFLICT(rule_id,node_id) DO UPDATE SET
                rule_revision=excluded.rule_revision, alert_active=excluded.alert_active,
                active_since=excluded.active_since, last_evaluated_at=excluded.last_evaluated_at,
@@ -1777,7 +2025,12 @@ impl Db {
                total_samples=excluded.total_samples, last_notified_at=excluded.last_notified_at,
                recovery_pending=excluded.recovery_pending, silenced_until=excluded.silenced_until,
                silenced_forever=excluded.silenced_forever,
-               notification_claimed_at=excluded.notification_claimed_at, updated_at=excluded.updated_at",
+               notification_claimed_at=excluded.notification_claimed_at,
+               notification_kind=excluded.notification_kind,
+               notification_attempts=excluded.notification_attempts,
+               notification_next_retry_at=excluded.notification_next_retry_at,
+               notification_failed=excluded.notification_failed,
+               updated_at=excluded.updated_at",
             params![
                 rule_id,
                 node_id,
@@ -1792,7 +2045,11 @@ impl Db {
                 recovery_pending,
                 silenced_until,
                 silenced_forever,
-                notification_claimed_at
+                notification_claimed_at,
+                notification_kind,
+                notification_attempts,
+                notification_next_retry_at,
+                notification_failed
             ],
         )?;
         tx.commit()?;
@@ -1818,35 +2075,54 @@ impl Db {
         node_id: i64,
         kind: LoadNotificationKind,
     ) -> Result<bool> {
-        let row: Option<(bool, bool, bool, bool, Option<i64>, bool, Option<i64>)> = self
-            .conn()
-            .query_row(
-                "SELECT r.enabled, t.enabled, s.alert_active, s.recovery_pending,
-                        s.notification_claimed_at, s.silenced_forever, s.silenced_until
+        let row: Option<(bool, bool, bool, bool, Option<i64>, bool, Option<i64>, Option<String>, bool)> =
+            self.conn()
+                .query_row(
+                    "SELECT r.enabled, t.enabled, s.alert_active, s.recovery_pending,
+                        s.notification_claimed_at, s.silenced_forever, s.silenced_until,
+                        s.notification_kind, s.notification_failed
                  FROM load_rule r JOIN load_rule_node t ON t.rule_id=r.id AND t.node_id=?2
                  JOIN load_alert_state s ON s.rule_id=r.id AND s.node_id=t.node_id
                  WHERE r.id=?1",
-                params![rule_id, node_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((rule_enabled, target_enabled, active, recovery_pending, claim, forever, until)) = row
+                    params![rule_id, node_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                        ))
+                    },
+                )
+                .optional()?;
+        let Some((
+            rule_enabled,
+            target_enabled,
+            active,
+            recovery_pending,
+            claim,
+            forever,
+            until,
+            stored_kind,
+            failed,
+        )) = row
         else {
             return Ok(false);
+        };
+        let expected_kind = match kind {
+            LoadNotificationKind::Alert => "alert",
+            LoadNotificationKind::Recovery => "recovery",
         };
         if !rule_enabled
             || !target_enabled
             || claim.is_none()
+            || stored_kind.as_deref() != Some(expected_kind)
+            || failed
             || forever
             || until.is_some_and(|value| value > Utc::now().timestamp())
         {
@@ -1856,6 +2132,72 @@ impl Db {
             LoadNotificationKind::Alert => active,
             LoadNotificationKind::Recovery => !active && recovery_pending,
         })
+    }
+
+    /// Claims retry work directly from its stored alert snapshot. A retry must
+    /// not depend on receiving another metric sample: the node may have gone
+    /// offline after the original Telegram request failed.
+    pub fn claim_due_load_notification_retries(&self, now: i64) -> Result<Vec<LoadNotificationAction>> {
+        let conn = self.conn();
+        let candidates = {
+            let mut stmt = conn.prepare(
+                "SELECT r.id, n.id, r.name, n.name, r.metric, r.threshold, r.ratio,
+                        r.interval_minutes, s.latest_value, s.matched_samples,
+                        s.total_samples, s.notification_kind
+                 FROM load_alert_state s
+                 JOIN load_rule r ON r.id=s.rule_id AND r.enabled=1
+                 JOIN load_rule_node t ON t.rule_id=s.rule_id AND t.node_id=s.node_id AND t.enabled=1
+                 JOIN node n ON n.id=s.node_id
+                 WHERE (s.notification_claimed_at IS NULL OR s.notification_claimed_at<=?1-300)
+                   AND s.notification_failed=0
+                   AND s.notification_next_retry_at IS NOT NULL
+                   AND s.notification_next_retry_at<=?1
+                   AND s.silenced_forever=0
+                   AND (s.silenced_until IS NULL OR s.silenced_until<=?1)
+                   AND ((s.notification_kind='alert' AND s.alert_active=1)
+                     OR (s.notification_kind='recovery' AND s.alert_active=0 AND s.recovery_pending=1))",
+            )?;
+            let rows = stmt.query_map([now], |row| {
+                let kind = match row.get::<_, String>(11)?.as_str() {
+                    "alert" => LoadNotificationKind::Alert,
+                    _ => LoadNotificationKind::Recovery,
+                };
+                Ok(LoadNotificationAction {
+                    rule_id: row.get(0)?,
+                    node_id: row.get(1)?,
+                    rule_name: row.get(2)?,
+                    node_name: row.get(3)?,
+                    metric: row.get(4)?,
+                    threshold: row.get(5)?,
+                    ratio: row.get(6)?,
+                    interval_minutes: row.get(7)?,
+                    latest_value: row.get(8)?,
+                    matched_samples: row.get(9)?,
+                    total_samples: row.get(10)?,
+                    kind,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut claimed = Vec::new();
+        for action in candidates {
+            let kind = match action.kind {
+                LoadNotificationKind::Alert => "alert",
+                LoadNotificationKind::Recovery => "recovery",
+            };
+            let changed = conn.execute(
+                 "UPDATE load_alert_state SET notification_claimed_at=?3
+                 WHERE rule_id=?1 AND node_id=?2 AND notification_kind=?4
+                   AND (notification_claimed_at IS NULL OR notification_claimed_at<=?3-300)
+                   AND notification_failed=0
+                   AND notification_next_retry_at<=?3",
+                params![action.rule_id, action.node_id, now, kind],
+            )?;
+            if changed == 1 {
+                claimed.push(action);
+            }
+        }
+        Ok(claimed)
     }
 
     pub fn complete_load_notification(
@@ -1871,7 +2213,9 @@ impl Db {
                     "UPDATE load_alert_state SET
                      last_notified_at=CASE WHEN alert_active=1 THEN ?3 ELSE last_notified_at END,
                      recovery_pending=CASE WHEN alert_active=1 THEN 0 ELSE recovery_pending END,
-                     notification_claimed_at=NULL, updated_at=?3
+                     notification_claimed_at=NULL, notification_kind=NULL,
+                     notification_attempts=0, notification_next_retry_at=NULL,
+                     notification_failed=0, updated_at=?3
                      WHERE rule_id=?1 AND node_id=?2
                            AND notification_claimed_at IS NOT NULL",
                     params![rule_id, node_id, now],
@@ -1888,7 +2232,9 @@ impl Db {
                        WHEN alert_active=0 AND recovery_pending=1 THEN 0
                        ELSE recovery_pending
                      END,
-                     notification_claimed_at=NULL, updated_at=?3
+                     notification_claimed_at=NULL, notification_kind=NULL,
+                     notification_attempts=0, notification_next_retry_at=NULL,
+                     notification_failed=0, updated_at=?3
                      WHERE rule_id=?1 AND node_id=?2
                            AND notification_claimed_at IS NOT NULL",
                     params![rule_id, node_id, now],
@@ -1907,6 +2253,53 @@ impl Db {
         Ok(())
     }
 
+    pub fn record_load_notification_failure(
+        &self,
+        rule_id: i64,
+        node_id: i64,
+        attempted_at: i64,
+        retry_delays: &[i64],
+    ) -> Result<Option<DeliveryFailure>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let Some(previous_attempts) = tx
+            .query_row(
+                "SELECT notification_attempts FROM load_alert_state
+                 WHERE rule_id=?1 AND node_id=?2
+                   AND notification_claimed_at IS NOT NULL
+                   AND notification_kind IS NOT NULL AND notification_failed=0",
+                params![rule_id, node_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let failure_count = previous_attempts.saturating_add(1);
+        let outcome = if let Some(delay) = retry_delays.get((failure_count - 1) as usize) {
+            let retry_at = attempted_at.saturating_add(*delay);
+            tx.execute(
+                "UPDATE load_alert_state
+                 SET notification_attempts=?3, notification_next_retry_at=?4,
+                     notification_claimed_at=NULL, updated_at=?5
+                 WHERE rule_id=?1 AND node_id=?2",
+                params![rule_id, node_id, failure_count, retry_at, attempted_at],
+            )?;
+            DeliveryFailure::Retry { failure_count, retry_at }
+        } else {
+            tx.execute(
+                "UPDATE load_alert_state
+                 SET notification_attempts=?3, notification_next_retry_at=NULL,
+                     notification_claimed_at=NULL, notification_failed=1, updated_at=?4
+                 WHERE rule_id=?1 AND node_id=?2",
+                params![rule_id, node_id, failure_count, attempted_at],
+            )?;
+            DeliveryFailure::Abandoned { failure_count }
+        };
+        tx.commit()?;
+        Ok(Some(outcome))
+    }
+
     pub fn set_load_alert_silence(
         &self,
         rule_id: i64,
@@ -1918,7 +2311,9 @@ impl Db {
         let changed = self.conn().execute(
             "UPDATE load_alert_state
              SET silenced_until=?3, silenced_forever=?4,
-                 notification_claimed_at=NULL, updated_at=?5
+                 notification_claimed_at=NULL, notification_kind=NULL,
+                 notification_attempts=0, notification_next_retry_at=NULL,
+                 notification_failed=0, updated_at=?5
              WHERE rule_id=?1 AND node_id=?2 AND alert_active=1",
             params![rule_id, node_id, silenced_until, silenced_forever, now],
         )?;
@@ -1991,7 +2386,8 @@ impl Db {
         let b = conn.execute("DELETE FROM ping_record WHERE ts < ?1", [cutoff])?;
         let c = conn.execute(
             "DELETE FROM common_notification_event
-             WHERE completed_at IS NOT NULL AND completed_at < ?1",
+             WHERE (completed_at IS NOT NULL AND completed_at < ?1)
+                OR (failed_at IS NOT NULL AND failed_at < ?1)",
             [cutoff],
         )?;
         Ok(a + b + c)
@@ -2564,8 +2960,8 @@ impl Db {
     ) -> Result<bool> {
         let changed = self.conn().execute(
             "INSERT OR IGNORE INTO common_notification_event
-             (id, kind, node_id, period_key, bucket, payload, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+             (id, kind, node_id, period_key, bucket, payload, created_at, next_retry_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?7)",
             params![id, kind, node_id, period_key, bucket, payload, created_at],
         )?;
         Ok(changed == 1)
@@ -2574,9 +2970,10 @@ impl Db {
     pub fn pending_common_events(&self, kind: &str) -> Result<Vec<CommonNotificationEvent>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, kind, node_id, period_key, bucket, payload
+            "SELECT id, kind, node_id, period_key, bucket, payload, attempts, next_retry_at
              FROM common_notification_event
-             WHERE kind=?1 AND completed_at IS NULL ORDER BY created_at, id",
+             WHERE kind=?1 AND completed_at IS NULL AND failed_at IS NULL
+             ORDER BY created_at, id",
         )?;
         let rows = stmt
             .query_map([kind], |row| {
@@ -2587,6 +2984,8 @@ impl Db {
                     period_key: row.get(3)?,
                     bucket: row.get(4)?,
                     payload: row.get(5)?,
+                    attempts: row.get(6)?,
+                    next_retry_at: row.get(7)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -2600,7 +2999,8 @@ impl Db {
         let changed = self.conn().execute(
             "UPDATE common_notification_event
              SET claimed_at=?2
-             WHERE id=?1 AND completed_at IS NULL
+             WHERE id=?1 AND completed_at IS NULL AND failed_at IS NULL
+               AND COALESCE(next_retry_at, created_at) <= ?2
                AND (claimed_at IS NULL OR claimed_at <= ?2-?3)",
             params![id, now, stale_after.max(1)],
         )?;
@@ -2623,6 +3023,53 @@ impl Db {
             params![id, now],
         )?;
         Ok(())
+    }
+
+    pub fn record_common_event_failure(
+        &self,
+        id: &str,
+        attempted_at: i64,
+        reason: &str,
+        retry_delays: &[i64],
+    ) -> Result<Option<DeliveryFailure>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let Some(previous_attempts) = tx
+            .query_row(
+                "SELECT attempts FROM common_notification_event
+                 WHERE id=?1 AND completed_at IS NULL AND failed_at IS NULL
+                   AND claimed_at IS NOT NULL",
+                [id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let failure_count = previous_attempts.saturating_add(1);
+        let outcome = if let Some(delay) = retry_delays.get((failure_count - 1) as usize) {
+            let retry_at = attempted_at.saturating_add(*delay);
+            tx.execute(
+                "UPDATE common_notification_event
+                 SET attempts=?2, next_retry_at=?3, claimed_at=NULL
+                 WHERE id=?1",
+                params![id, failure_count, retry_at],
+            )?;
+            DeliveryFailure::Retry { failure_count, retry_at }
+        } else {
+            let reason: String =
+                reason.chars().filter(|character| !character.is_control()).take(512).collect();
+            tx.execute(
+                "UPDATE common_notification_event
+                 SET attempts=?2, next_retry_at=NULL, claimed_at=NULL,
+                     failed_at=?3, failure_reason=?4
+                 WHERE id=?1",
+                params![id, failure_count, attempted_at, reason],
+            )?;
+            DeliveryFailure::Abandoned { failure_count }
+        };
+        tx.commit()?;
+        Ok(Some(outcome))
     }
 
     /// Discards a pending event whose snapshot is no longer valid. Deleting
@@ -3614,6 +4061,51 @@ mod load_notification_db_tests {
     }
 
     #[test]
+    fn load_notification_stops_after_two_retries_until_state_changes() {
+        let db = db();
+        let node_id = node(&db, "A");
+        let rule_id =
+            db.create_load_rule(&rule(vec![LoadRuleNode { node_id, enabled: true }], false)).unwrap();
+
+        let first = db
+            .apply_load_evaluation(rule_id, node_id, 1, true, Some(90.0), 1, 1, 100, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.record_load_notification_failure(rule_id, node_id, 100, &[60, 120]).unwrap(),
+            Some(DeliveryFailure::Retry { failure_count: 1, retry_at: 160 })
+        );
+        assert!(!db.load_alert_due(rule_id, node_id, 159).unwrap());
+        assert!(db.load_alert_due(rule_id, node_id, 160).unwrap());
+        assert!(db.claim_due_load_notification_retries(159).unwrap().is_empty());
+        let retry_one = db.claim_due_load_notification_retries(160).unwrap().pop().unwrap();
+        assert_eq!(retry_one.kind, first.kind);
+        assert_eq!(
+            db.record_load_notification_failure(rule_id, node_id, 160, &[60, 120]).unwrap(),
+            Some(DeliveryFailure::Retry { failure_count: 2, retry_at: 280 })
+        );
+        let retry_two = db.claim_due_load_notification_retries(280).unwrap().pop().unwrap();
+        assert_eq!(retry_two.kind, first.kind);
+        assert_eq!(
+            db.record_load_notification_failure(rule_id, node_id, 280, &[60, 120]).unwrap(),
+            Some(DeliveryFailure::Abandoned { failure_count: 3 })
+        );
+        assert!(db
+            .apply_load_evaluation(rule_id, node_id, 1, true, Some(93.0), 1, 1, 340, true)
+            .unwrap()
+            .is_none());
+
+        assert!(db
+            .apply_load_evaluation(rule_id, node_id, 1, false, Some(50.0), 0, 1, 400, true)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .apply_load_evaluation(rule_id, node_id, 1, true, Some(94.0), 1, 1, 460, true)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
     fn silence_keeps_the_internal_alert_and_blocks_then_allows_notifications() {
         let db = db();
         let node_id = node(&db, "A");
@@ -3730,12 +4222,53 @@ mod common_notification_db_tests {
     use super::*;
 
     #[test]
-    fn schema_v7_migrates_old_sessions_and_keeps_new_metadata_atomic() {
-        let path = std::env::temp_dir().join(format!("monitor-schema-v7-{}.db", rand::random::<u64>()));
+    fn offline_delivery_is_bounded_and_recovery_consumes_failed_outages() {
+        let db = Db::open(":memory:").unwrap();
+        let node_id =
+            db.create_node(&Node { name: "node".into(), ..Node::default() }, "notify-token").unwrap();
+
+        assert!(db.mark_notification_pending(node_id, 100).unwrap());
+        assert!(db.confirm_notification_offline(node_id, 100).unwrap());
+        assert!(db.notification_offline_delivery_pending(node_id));
+        assert_eq!(db.take_notification_offline(node_id).unwrap(), (true, false, false));
+
+        assert!(db.mark_notification_pending(node_id, 200).unwrap());
+        assert!(db.confirm_notification_offline(node_id, 200).unwrap());
+        assert!(db.mark_notification_offline_delivered(node_id).unwrap());
+        assert!(!db.notification_offline_delivery_pending(node_id));
+        assert_eq!(db.take_notification_offline(node_id).unwrap(), (true, true, false));
+
+        assert!(db.mark_notification_pending(node_id, 300).unwrap());
+        assert!(db.confirm_notification_offline(node_id, 300).unwrap());
+        assert_eq!(
+            db.record_notification_offline_failure(node_id, 400, &[60, 120]).unwrap(),
+            Some(DeliveryFailure::Retry { failure_count: 1, retry_at: 460 })
+        );
+        assert_eq!(
+            db.record_notification_offline_failure(node_id, 460, &[60, 120]).unwrap(),
+            Some(DeliveryFailure::Retry { failure_count: 2, retry_at: 580 })
+        );
+        assert_eq!(
+            db.record_notification_offline_failure(node_id, 580, &[60, 120]).unwrap(),
+            Some(DeliveryFailure::Abandoned { failure_count: 3 })
+        );
+        assert!(!db.notification_offline_delivery_pending(node_id));
+        assert!(db.pending_notification_states().unwrap().is_empty());
+        assert_eq!(db.take_notification_offline(node_id).unwrap(), (true, false, true));
+    }
+
+    #[test]
+    fn schema_v9_migrates_notification_delivery_and_keeps_new_metadata_atomic() {
+        let path = std::env::temp_dir().join(format!("monitor-schema-v9-{}.db", rand::random::<u64>()));
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
                 "CREATE TABLE session (token_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
+                 CREATE TABLE notification_state (
+                   node_id INTEGER PRIMARY KEY,
+                   pending_since INTEGER,
+                   offline_confirmed INTEGER NOT NULL DEFAULT 0
+                 );
                  PRAGMA user_version = 5;",
             )
             .unwrap();
@@ -3753,6 +4286,10 @@ mod common_notification_db_tests {
         let node_columns = columns_of(&db.conn(), "node").unwrap();
         for column in ["node_group", "tags"] {
             assert!(node_columns.contains(column), "missing migrated node column {column}");
+        }
+        let notification_columns = columns_of(&db.conn(), "notification_state").unwrap();
+        for column in ["offline_notified", "offline_attempts", "offline_next_retry_at", "offline_failed"] {
+            assert!(notification_columns.contains(column), "missing notification column {column}");
         }
 
         let now = Utc::now().timestamp();
@@ -3777,6 +4314,28 @@ mod common_notification_db_tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.to_string_lossy()));
         }
+    }
+
+    #[test]
+    fn schema_v8_treats_pre_upgrade_confirmed_outages_as_already_delivered() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE notification_state (
+               node_id INTEGER PRIMARY KEY,
+               pending_since INTEGER,
+               offline_confirmed INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO notification_state VALUES (1, NULL, 1);",
+        )
+        .unwrap();
+        migrate_to_8(&conn).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT offline_notified FROM notification_state WHERE node_id=1", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -3812,6 +4371,31 @@ mod common_notification_db_tests {
         db.enqueue_common_event("event-2", "renew", Some(node_id), "2026-09-25", 0, "", 100).unwrap();
         db.delete_node(node_id).unwrap();
         assert!(db.pending_common_events("renew").unwrap().is_empty());
+    }
+
+    #[test]
+    fn common_event_stops_after_two_retries() {
+        let db = Db::open(":memory:").unwrap();
+        db.enqueue_common_event("retry", "login", None, "", 0, "{}", 100).unwrap();
+
+        assert!(db.claim_common_event("retry", 100, 600).unwrap());
+        assert_eq!(
+            db.record_common_event_failure("retry", 100, "network", &[60, 120]).unwrap(),
+            Some(DeliveryFailure::Retry { failure_count: 1, retry_at: 160 })
+        );
+        assert!(!db.claim_common_event("retry", 159, 600).unwrap());
+        assert!(db.claim_common_event("retry", 160, 600).unwrap());
+        assert_eq!(
+            db.record_common_event_failure("retry", 160, "network", &[60, 120]).unwrap(),
+            Some(DeliveryFailure::Retry { failure_count: 2, retry_at: 280 })
+        );
+        assert!(db.claim_common_event("retry", 280, 600).unwrap());
+        assert_eq!(
+            db.record_common_event_failure("retry", 280, "permanent", &[60, 120]).unwrap(),
+            Some(DeliveryFailure::Abandoned { failure_count: 3 })
+        );
+        assert!(db.pending_common_events("login").unwrap().is_empty());
+        assert!(!db.claim_common_event("retry", 1_000, 600).unwrap());
     }
 
     #[test]

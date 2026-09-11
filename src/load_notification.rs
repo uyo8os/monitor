@@ -4,6 +4,7 @@
 //! notification state machine. It reads the minute metric history, keeps one
 //! durable state per rule/node pair, and uses the existing Telegram sender.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +13,8 @@ use chrono::Utc;
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
-use crate::db::{Db, LoadMetricSample, LoadNotificationAction, LoadNotificationKind, Node};
+use crate::db::{Db, DeliveryFailure, LoadMetricSample, LoadNotificationAction, LoadNotificationKind, Node};
+use crate::notification::{TELEGRAM_RETRY_DELAYS_SECONDS, TELEGRAM_TOTAL_ATTEMPTS};
 use crate::Shared;
 
 const EVALUATION_TICK_SECONDS: u64 = 30;
@@ -21,15 +23,26 @@ const SEND_SLOTS: usize = 8;
 #[derive(Clone)]
 pub struct LoadNotificationManager {
     send_slots: Arc<Semaphore>,
+    generation: Arc<AtomicU64>,
 }
 
 impl Default for LoadNotificationManager {
     fn default() -> Self {
-        Self { send_slots: Arc::new(Semaphore::new(SEND_SLOTS)) }
+        Self { send_slots: Arc::new(Semaphore::new(SEND_SLOTS)), generation: Arc::new(AtomicU64::new(0)) }
     }
 }
 
 impl LoadNotificationManager {
+    /// Stops pre-restore evaluations and deliveries from touching replacement
+    /// database rows that happen to reuse the same rule and node IDs.
+    pub fn invalidate_all(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.generation.load(Ordering::Acquire) == generation
+    }
+
     /// Starts one scheduler for the hub. The scheduler is intentionally
     /// global rather than one Tokio task per rule: editing many rules cannot
     /// leak timers, and the durable last-evaluated timestamp remains the
@@ -48,6 +61,7 @@ impl LoadNotificationManager {
     }
 
     async fn evaluate_once(&self, app: Shared, send_notifications: bool) {
+        let generation = self.generation.load(Ordering::Acquire);
         let now = Utc::now().timestamp();
         let result = tokio::task::spawn_blocking({
             let app = app.clone();
@@ -65,24 +79,46 @@ impl LoadNotificationManager {
                 return;
             }
         };
+        if !self.is_current(generation) {
+            return;
+        }
         for action in actions {
+            if !self.is_current(generation) {
+                return;
+            }
             let Ok(permit) = self.send_slots.clone().try_acquire_owned() else {
                 warn!(
                     rule_id = action.rule_id,
                     node_id = action.node_id,
                     "load notification send queue is full; releasing claim for the next evaluation"
                 );
-                let _ = tokio::task::block_in_place(|| {
-                    app.db.release_load_notification_claim(action.rule_id, action.node_id)
-                });
+                if self.is_current(generation) {
+                    let _ = tokio::task::block_in_place(|| {
+                        app.db.release_load_notification_claim(action.rule_id, action.node_id)
+                    });
+                }
                 continue;
             };
             let app = app.clone();
+            let manager = self.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                deliver(app, action).await;
+                deliver(manager, app, action, generation).await;
             });
         }
+    }
+
+    fn schedule_retry(&self, app: Shared, generation: u64, retry_at: i64) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let wait = retry_at.saturating_sub(Utc::now().timestamp()).max(0) as u64;
+            if wait > 0 {
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+            }
+            if manager.is_current(generation) {
+                manager.evaluate_once(app, true).await;
+            }
+        });
     }
 }
 
@@ -114,6 +150,12 @@ fn evaluate_due(db: &Db, now: i64, send_notifications: bool) -> Result<Vec<LoadN
                 }
             }
             let total_samples = values.len() as i64;
+            // Missing telemetry is not proof that resource usage recovered.
+            // Leave the last alert state untouched until the node reports a
+            // real sample again; lifecycle notifications cover the outage.
+            if total_samples == 0 {
+                continue;
+            }
             let matched_samples = values.iter().filter(|value| **value >= rule.threshold).count() as i64;
             let active = load_is_active(&values, rule.threshold, rule.ratio);
             let latest_value = values.last().copied();
@@ -132,6 +174,9 @@ fn evaluate_due(db: &Db, now: i64, send_notifications: bool) -> Result<Vec<LoadN
                 actions.push(action);
             }
         }
+    }
+    if send_notifications {
+        actions.extend(db.claim_due_load_notification_retries(now)?);
     }
     Ok(actions)
 }
@@ -159,57 +204,96 @@ fn metric_value(metric: &str, sample: &LoadMetricSample, node: &Node) -> Option<
     }
 }
 
-async fn deliver(app: Shared, action: LoadNotificationAction) {
+async fn deliver(
+    manager: LoadNotificationManager,
+    app: Shared,
+    action: LoadNotificationAction,
+    generation: u64,
+) {
+    if !manager.is_current(generation) {
+        return;
+    }
     if !crate::api::notification_config(&app).enabled {
-        release_claim(&app, &action);
+        release_claim(&manager, &app, &action, generation);
         return;
     }
     if !claim_allowed(&app, &action) {
-        release_claim(&app, &action);
+        release_claim(&manager, &app, &action, generation);
         return;
     }
     let text = message(&action);
-    for attempt in 0..3 {
-        if !crate::api::notification_config(&app).enabled || !claim_allowed(&app, &action) {
-            release_claim(&app, &action);
-            return;
-        }
-        match crate::api::send_telegram_message(&app, &text).await {
-            Ok(()) => {
-                let result = tokio::task::block_in_place(|| {
-                    app.db.complete_load_notification(
-                        action.rule_id,
-                        action.node_id,
-                        action.kind,
-                        Utc::now().timestamp(),
-                    )
-                });
-                if let Err(error) = result {
-                    warn!(
-                        rule_id = action.rule_id,
-                        node_id = action.node_id,
-                        "recording load notification delivery failed: {error:#}"
-                    );
-                }
+    if !manager.is_current(generation) {
+        return;
+    }
+    if !crate::api::notification_config(&app).enabled || !claim_allowed(&app, &action) {
+        release_claim(&manager, &app, &action, generation);
+        return;
+    }
+    match crate::api::send_telegram_message(&app, &text).await {
+        Ok(()) => {
+            if !manager.is_current(generation) {
                 return;
             }
-            Err(error) if attempt < 2 => {
-                debug!(
-                    rule_id = action.rule_id,
-                    node_id = action.node_id,
-                    attempt = attempt + 1,
-                    "load notification send failed: {error}; retrying"
-                );
-                tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
-            }
-            Err(error) => {
+            let result = tokio::task::block_in_place(|| {
+                app.db.complete_load_notification(
+                    action.rule_id,
+                    action.node_id,
+                    action.kind,
+                    Utc::now().timestamp(),
+                )
+            });
+            if let Err(error) = result {
                 warn!(
                     rule_id = action.rule_id,
                     node_id = action.node_id,
-                    "load notification send failed: {error}"
+                    "recording load notification delivery failed: {error:#}"
                 );
-                release_claim(&app, &action);
+            }
+        }
+        Err(error) => {
+            if !manager.is_current(generation) {
                 return;
+            }
+            let outcome = tokio::task::block_in_place(|| {
+                app.db.record_load_notification_failure(
+                    action.rule_id,
+                    action.node_id,
+                    Utc::now().timestamp(),
+                    &TELEGRAM_RETRY_DELAYS_SECONDS,
+                )
+            });
+            match outcome {
+                Ok(Some(DeliveryFailure::Retry { failure_count, retry_at })) => {
+                    warn!(
+                        rule_id = action.rule_id,
+                        node_id = action.node_id,
+                        node = %action.node_name,
+                        failure_count,
+                        max_attempts = TELEGRAM_TOTAL_ATTEMPTS,
+                        retry_at,
+                        "load notification send failed: {error}; retry scheduled"
+                    );
+                    manager.schedule_retry(app, generation, retry_at);
+                }
+                Ok(Some(DeliveryFailure::Abandoned { failure_count })) => warn!(
+                    rule_id = action.rule_id,
+                    node_id = action.node_id,
+                    node = %action.node_name,
+                    failure_count,
+                    max_attempts = TELEGRAM_TOTAL_ATTEMPTS,
+                    "load notification marked failed and abandoned after retry limit: {error}"
+                ),
+                Ok(None) => debug!(
+                    rule_id = action.rule_id,
+                    node_id = action.node_id,
+                    "stale load notification failure was ignored"
+                ),
+                Err(store_error) => warn!(
+                    rule_id = action.rule_id,
+                    node_id = action.node_id,
+                    node = %action.node_name,
+                    "recording load notification failure failed: {store_error:#}; send error: {error}"
+                ),
             }
         }
     }
@@ -221,7 +305,15 @@ fn claim_allowed(app: &Shared, action: &LoadNotificationAction) -> bool {
     })
 }
 
-fn release_claim(app: &Shared, action: &LoadNotificationAction) {
+fn release_claim(
+    manager: &LoadNotificationManager,
+    app: &Shared,
+    action: &LoadNotificationAction,
+    generation: u64,
+) {
+    if !manager.is_current(generation) {
+        return;
+    }
     let _ = tokio::task::block_in_place(|| {
         app.db.release_load_notification_claim(action.rule_id, action.node_id)
     });
@@ -257,6 +349,7 @@ fn message(action: &LoadNotificationAction) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{LoadRule, LoadRuleNode};
 
     #[test]
     fn metric_units_are_converted_without_treating_network_as_percent() {
@@ -293,5 +386,40 @@ mod tests {
         // A complete interval is not required: one of two available samples
         // is enough for a 50% ratio, and equality meets the threshold.
         assert!(load_is_active(&[80.0, 70.0], 80.0, 0.5));
+    }
+
+    #[test]
+    fn an_empty_window_does_not_turn_an_existing_alert_into_recovery() {
+        let db = Db::open(":memory:").unwrap();
+        let node_id = db.create_node(&Node { name: "node".into(), ..Node::default() }, "load-token").unwrap();
+        let rule_id = db
+            .create_load_rule(&LoadRule {
+                id: 0,
+                name: "CPU".into(),
+                metric: "cpu".into(),
+                threshold: 80.0,
+                ratio: 0.5,
+                interval_minutes: 1,
+                enabled: true,
+                default_enabled: false,
+                revision: 1,
+                created_at: 0,
+                updated_at: 0,
+                nodes: vec![LoadRuleNode { node_id, enabled: true }],
+            })
+            .unwrap();
+        let first = db.apply_load_evaluation(rule_id, node_id, 1, true, Some(90.0), 1, 1, 100, true).unwrap();
+        db.complete_load_notification(rule_id, node_id, first.unwrap().kind, 101).unwrap();
+
+        assert!(evaluate_due(&db, 161, true).unwrap().is_empty());
+        assert_eq!(db.current_load_alerts(161).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn invalidation_rejects_work_from_the_previous_database_generation() {
+        let manager = LoadNotificationManager::default();
+        let generation = manager.generation.load(Ordering::Acquire);
+        manager.invalidate_all();
+        assert!(!manager.is_current(generation));
     }
 }
