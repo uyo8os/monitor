@@ -1,8 +1,9 @@
 #!/bin/sh
 # monitor hub installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/stqfdyr/monitor/main/install-hub.sh -o install-hub.sh
-#   sudo sh install-hub.sh
+#   curl -fsSL https://raw.githubusercontent.com/monitor-probe/monitor/main/install-hub.sh -o install-hub.sh
+#   chmod +x install-hub.sh
+#   sudo ./install-hub.sh
 #
 # Menu-driven when it has a terminal. A plain `curl ... | sh` has no terminal to
 # read an answer from, so it installs with the defaults instead of hanging on a
@@ -359,10 +360,10 @@ usage() {
 	cat <<TXT
 monitor hub 安装器
 
-  sudo sh install-hub.sh                有终端时给菜单，否则按默认安装
-  sudo sh install-hub.sh --port 8443    指定端口安装
-  sudo sh install-hub.sh --uninstall    卸载，保留数据
-  sudo sh install-hub.sh --purge        卸载并删除数据库
+  sudo ./install-hub.sh                有终端时给菜单，否则按默认安装
+  sudo ./install-hub.sh --port 8443    指定端口安装
+  sudo ./install-hub.sh --uninstall    卸载，保留数据
+  sudo ./install-hub.sh --purge        卸载并删除数据库
 
   --port <n>     本机监听端口，默认 $PORT
   --site <url>   一般不用填。面板拼安装命令用的是浏览器地址栏，配好反代
