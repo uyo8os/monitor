@@ -18,7 +18,7 @@ SHA=$(printf '%s' "$SHA" | tr -d '\r')
 [ -n "${TAG:-}" ] && [ -n "${SHA:-}" ] ||
   { echo "web-theme.pin must hold '<tag> <sha256>'" >&2; exit 1; }
 DEST=target/theme
-URL="https://github.com/stqfdyr/monitor-theme-default/releases/download/$TAG/theme.tar.gz"
+URL="https://github.com/uyo8os/monitor-theme-default/releases/download/$TAG/theme.tar.gz"
 
 # Already unpacked at this pin. A theme placed here by hand with a matching
 # stamp is left alone too, which is how you build against one that has not been

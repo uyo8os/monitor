@@ -22,9 +22,9 @@
 
 | 仓库 | 说明 |
 |---|---|
-| [monitor](https://github.com/stqfdyr/monitor) | hub：后台、API、公开页宿主 |
+| [monitor](https://github.com/uyo8os/monitor) | hub：后台、API、公开页宿主 |
 | [agent](https://github.com/stqfdyr/agent) | Linux agent |
-| [monitor-theme-default](https://github.com/stqfdyr/monitor-theme-default) | 内置默认主题 |
+| [monitor-theme-default](https://github.com/uyo8os/monitor-theme-default) | 内置默认主题 |
 
 ```
 agent (Linux)  ──WebSocket / JSON-RPC 2.0──▶  hub (axum + SQLite)  ──▶  后台 + 状态页
@@ -45,7 +45,7 @@ cargo build --release
 ## 安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/monitor-probe/monitor/main/install-hub.sh -o install-hub.sh
+curl -fsSL https://raw.githubusercontent.com/uyo8os/monitor/main/install-hub.sh -o install-hub.sh
 chmod +x install-hub.sh
 sudo ./install-hub.sh
 ```
@@ -146,10 +146,10 @@ GitHub 代理（如 `https://ghfast.top`），hub 拉 release 时会用它，节
 ```bash
 docker run -d --name monitor -p 28080:28080 \
   -v monitor-data:/data -e TZ=Asia/Shanghai \
-  stqfdyr/monitor
+  uyo8os/monitor
 ```
 
-同一份镜像也发在 `ghcr.io/monitor-probe/monitor`，两个地址内容一致，每个 tag 由同一次构建推上去。
+同一份镜像也发在 `ghcr.io/uyo8os/monitor`，两个地址内容一致，每个 tag 由同一次构建推上去。
 
 `FROM scratch` 里放同一个 musl 二进制加一份 zoneinfo，约 10 MB，以 uid 65534 运行，数据库和主题
 目录都在 `/data`。首次启动的应急密码在 `docker logs monitor` 里。
@@ -250,7 +250,7 @@ ingress:
 ## 主题
 
 主题目录复制到 `--themes` 指向的位置后，在后台「主题」页切换，无需重启。选中的主题缺失或损坏时回落到内置默认主题。主题包格式见
-[monitor-theme-default](https://github.com/stqfdyr/monitor-theme-default)。
+[monitor-theme-default](https://github.com/uyo8os/monitor-theme-default)。
 
 主题的 `theme.json` 里 `url` 指向 GitHub 仓库时，卡片上的 ⟳ 从该仓库最新的 release 取 `theme.tar.gz`
 装上；tag 和已装版本相同就不下载。走「设置」里的 GitHub 代理。

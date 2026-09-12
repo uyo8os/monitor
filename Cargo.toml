@@ -4,7 +4,7 @@ version = "0.1.21"
 edition = "2021"
 license = "MIT"
 description = "Lightweight server monitoring hub"
-repository = "https://github.com/stqfdyr/monitor"
+repository = "https://github.com/uyo8os/monitor"
 
 [dependencies]
 anyhow = "1"

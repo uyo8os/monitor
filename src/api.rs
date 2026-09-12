@@ -2429,7 +2429,7 @@ mod tests {
     /// trust boundary: whatever this accepts, the hub will fetch.
     #[test]
     fn only_a_github_repository_url_can_name_a_release_to_download() {
-        assert_eq!(github_repo("https://github.com/stqfdyr/monitor"), Some(("stqfdyr", "monitor")));
+        assert_eq!(github_repo("https://github.com/uyo8os/monitor"), Some(("stqfdyr", "monitor")));
         // A link to the repository, however the author wrote it down.
         assert_eq!(github_repo("https://github.com/a/b.git"), Some(("a", "b")));
         assert_eq!(github_repo("https://github.com/a/b/tree/main"), Some(("a", "b")));

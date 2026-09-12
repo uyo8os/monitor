@@ -3,7 +3,7 @@
 Rust 服务器探针的 **hub**：看状态、看流量、看延迟、算成本，并发送 Telegram 通知。
 
 agent 在 [独立仓库](https://github.com/stqfdyr/agent)。后台在 `web-admin/`；默认公开页主题在
-[monitor-theme-default](https://github.com/stqfdyr/monitor-theme-default)，**以发布好的
+[monitor-theme-default](https://github.com/uyo8os/monitor-theme-default)，**以发布好的
 `theme.tar.gz` 形式消费**——`web-theme.pin` 钉住 `<tag> <sha256>`，构建时下载校验解到
 `target/theme/`。两份产物都由 `rust-embed` 编译进二进制，外部主题由 hub 在运行时从磁盘读取。
 

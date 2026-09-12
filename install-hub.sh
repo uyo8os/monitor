@@ -1,7 +1,7 @@
 #!/bin/sh
 # monitor hub installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/monitor-probe/monitor/main/install-hub.sh -o install-hub.sh
+#   curl -fsSL https://raw.githubusercontent.com/uyo8os/monitor/main/install-hub.sh -o install-hub.sh
 #   chmod +x install-hub.sh
 #   sudo ./install-hub.sh
 #
@@ -10,7 +10,7 @@
 # prompt nobody can see.
 set -eu
 
-REPO="stqfdyr/monitor"
+REPO="uyo8os/monitor"
 SERVICE="monitor-hub"
 UNIT="/etc/systemd/system/monitor-hub.service"
 # Everything but the unit lives under one directory: the two binaries at the
