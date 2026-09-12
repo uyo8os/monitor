@@ -52,11 +52,18 @@ pub struct Agent {
     /// Wall-clock minute this session has already accounted for. A history
     /// row is written when a report lands past it.
     pub last_minute: i64,
-    /// `(unix seconds, total_rx, total_tx)` as they stood at the last history
-    /// row, so the next one carries the average rate over the gap. Without it
-    /// the row held one instantaneous reading -- a 1-in-60 sample of the minute
-    /// it claims to describe. See [`report`].
-    pub mark: Option<(i64, i64, i64)>,
+    /// `(monotonic instant, total_rx, total_tx)` as they stood at the last
+    /// history row, so the next one carries the average rate over the gap.
+    /// Without it the row held one instantaneous reading -- a 1-in-60 sample of
+    /// the minute it claims to describe. See [`report`].
+    ///
+    /// An `Instant`, not the wall clock the stamp comes from: this one is a
+    /// *duration* and nothing else here is. NTP stepping the clock back -- a
+    /// fresh boot correcting itself, a snapshot restored -- makes a wall-clock
+    /// difference negative, and the `.max(1)` that keeps the division safe then
+    /// divides a whole minute of bytes by one second. The agent computes the
+    /// same quantity against `std::time::Instant` for the same reason.
+    pub mark: Option<(Instant, i64, i64)>,
     /// Running mean of the minute in progress, for the same reason.
     minute: Minute,
 }
@@ -382,6 +389,9 @@ fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()>
         );
     }
     let now = Utc::now().timestamp();
+    // Read once, beside the wall clock: the stamp is a point in time and comes
+    // from `now`, the rate below is a duration and comes from this one.
+    let tick = Instant::now();
     // A placeholder rather than the empty string, which `accumulate` reads as
     // "this node has no baseline yet". An agent that sends no boot_id -- an
     // older one, or a box without the file -- would otherwise re-align on
@@ -431,19 +441,19 @@ fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()>
         let mut row = metrics.clone();
         entry.minute.write_into(&mut row);
         if let (Some((since, rx0, tx0)), Some(obj)) = (entry.mark, row.as_object_mut()) {
-            let elapsed = (now - since).max(1);
+            let elapsed = tick.saturating_duration_since(since).as_secs().max(1) as i64;
             obj.insert("net_rx".into(), json!((traffic.total_rx - rx0).max(0) / elapsed));
             obj.insert("net_tx".into(), json!((traffic.total_tx - tx0).max(0) / elapsed));
         }
         entry.last_minute = minute;
-        entry.mark = Some((now, traffic.total_rx, traffic.total_tx));
+        entry.mark = Some((tick, traffic.total_rx, traffic.total_tx));
         entry.minute = Minute::default();
         row
     });
     // A session that has just started measures the next row's rate from its
     // own first report; without a mark the row would carry the agent's
     // instantaneous reading instead of the average over the gap.
-    entry.mark.get_or_insert((now, traffic.total_rx, traffic.total_tx));
+    entry.mark.get_or_insert((tick, traffic.total_rx, traffic.total_tx));
     drop(agents);
 
     if let Some(row) = &row {
@@ -649,13 +659,15 @@ mod tests {
         // traffic baseline: nothing is booked until a second one arrives.
         dispatch(&app, id, "ip", &burst(1_000, 0, 100.0, 100)).unwrap();
         // Rewind the bookkeeping a minute, so the next report crosses the
-        // boundary with a minute of elapsed time behind it.
-        let now = Utc::now().timestamp();
+        // boundary with a minute of elapsed time behind it. The mark is an
+        // `Instant`, which is the whole point: a wall-clock difference can come
+        // back negative when NTP steps the clock, and there is no way to write
+        // that here -- reverting the field to a timestamp fails to compile.
         {
             let mut agents = app.agents.write().unwrap();
             let entry = agents.get_mut(&id).unwrap();
             entry.last_minute -= 1;
-            entry.mark = Some((now - 60, 0, 0));
+            entry.mark = Some((Instant::now() - Duration::from_secs(60), 0, 0));
         }
         // 60 MB arrived and the machine was busy for half the minute; by the
         // next sample both are over.

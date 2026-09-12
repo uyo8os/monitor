@@ -759,6 +759,21 @@ pub(crate) const PUBLIC_METRICS: [&str; 18] = [
 /// One node as the UI consumes it: stored config, live metrics and the hub's
 /// accumulated traffic in a single object.
 fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool) -> Value {
+    // The three capacities arrive twice: once in `Facts`, which is sent at the
+    // handshake and stored, and again in every `Metrics`. A machine that gains
+    // a disk while the agent is running -- the agent re-reads its mount table
+    // every sample precisely so that it shows -- then has a stored figure that
+    // is stale until the next reconnect, which may be days away. Answering with
+    // the report while one is connected is what keeps every consumer of this
+    // view on one number: the card reads the live metrics, the detail page
+    // reads these, and they were showing the same machine two capacities.
+    // Offline, the stored one is all there is, which is what that column is for.
+    // No floor on the value: a box that has just had its swap turned off
+    // reports zero and means it. A node connected but not yet reporting holds
+    // `Null`, where `get` answers nothing and the stored figure stands.
+    let live = |key: &str, stored: i64| {
+        current.and_then(|a| a.metrics.get(key).and_then(serde_json::Value::as_i64)).unwrap_or(stored)
+    };
     let mut view = json!({
         "id": node.id,
         "name": node.name,
@@ -785,9 +800,9 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         "virt": node.virt,
         "cpu_name": node.cpu_name,
         "cpu_cores": node.cpu_cores,
-        "mem_total": node.mem_total,
-        "swap_total": node.swap_total,
-        "disk_total": node.disk_total,
+        "mem_total": live("mem_total", node.mem_total),
+        "swap_total": live("swap_total", node.swap_total),
+        "disk_total": live("disk_total", node.disk_total),
         "agent_version": node.agent_version,
         "price": node.price,
         "currency": node.currency,
@@ -870,6 +885,40 @@ fn default_hours() -> i64 {
     6
 }
 
+/// How many history windows are built at once.
+///
+/// `PUBLIC_HOURS` bounds what *one* request costs. Nothing bounded how many
+/// there could be, which is the same gap `main::RELAY_GATE` and
+/// `auth::PASSWORD_GATE` each close on the other two paths an anonymous caller
+/// can make expensive -- and this is the dearest of the three: every request
+/// holds the single connection the agents report through for its whole scan,
+/// measured at 118 ms for a week of four probes and growing with
+/// `retention_days`. Without a gate, 120 requests from one machine took the
+/// panel's own node list from 1 ms to 2.8 s.
+///
+/// Four, because the requests serialise on that one connection whatever this
+/// says: a fifth in flight buys no throughput, it only puts another scan in
+/// front of the next agent report. What the number really sets is how long that
+/// wait can get -- four at ~120 ms is half a second -- and it leaves room for a
+/// handful of people opening charts at the same moment, which is what a status
+/// page is for.
+///
+/// Refused rather than queued, as in `auth`: a queue lets the flood in anyway,
+/// only later.
+///
+/// **This gate is worth nothing without the `spawn_blocking` below.** The body
+/// of this handler never awaits, so a permit taken and dropped inside it is
+/// held only while a worker thread is actually running the handler -- at most
+/// one per worker, three on this hub. Measured at eight: 120 concurrent
+/// requests, zero refusals, the panel still at 14 s. It is the same trap
+/// `PASSWORD_CHECKS` is sized against and documented for ("闸门的值必须小于机器
+/// 真能同时跑的数量"), reached from the other side: not a value too high for the
+/// machine, but a handler that cannot hold more permits than the machine has
+/// threads. Moving the scan off the runtime is what makes "in flight" mean what
+/// it says -- and it is what every other heavy query here already does.
+const HISTORY_SLOTS: usize = 4;
+static HISTORY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(HISTORY_SLOTS);
+
 pub async fn metrics(
     State(app): State<Shared>,
     headers: HeaderMap,
@@ -880,29 +929,47 @@ pub async fn metrics(
     if !readable(&app, full, id) {
         return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
     }
+    // After the two point lookups above, so a caller with no business here is
+    // told that rather than being told to come back later.
+    let Ok(_permit) = HISTORY_GATE.try_acquire() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "too many history queries in flight, try again")
+            .into_response();
+    };
     let hours = w.hours.clamp(1, if full { ADMIN_HOURS } else { PUBLIC_HOURS });
     let since = Utc::now().timestamp() - hours * 3_600;
     let step = sample_step(hours, w.points);
     let wants = |name: &str| w.series.as_deref().is_none_or(|s| s == name);
-    // Probe names ride along with the samples they label, so the page needs no
-    // second request. Names only: targets and assignments stay behind `Admin`.
-    // Skipped when the probes were not asked for -- the resources tab has
-    // nothing to label, and this is a turn at the write connection.
-    let probes =
-        if wants("ping") { app.db.ping_task_names(id).unwrap_or_else(|_| json!({})) } else { json!({}) };
-    let metrics = if wants("metrics") { app.db.metrics(id, since, step) } else { Ok(vec![]) };
-    let ping = if wants("ping") { app.db.ping_records(id, since, step) } else { Ok((vec![], json!({}))) };
-    match (metrics, ping) {
+    let (want_metrics, want_ping) = (wants("metrics"), wants("ping"));
+    // Off the runtime, for the reason `db_stats` gives one screen down: this
+    // reads every probe result the node has kept inside the window and holds
+    // the connection the agents report through for the whole of it. That route
+    // is behind `Admin` and cheaper than this one, which anyone can reach.
+    //
+    // It is also what gives the gate above teeth: the permit is now held across
+    // an await, so four callers really are inside it at once rather than
+    // however many worker threads happen to exist.
+    let built = tokio::task::spawn_blocking(move || {
+        // Probe names ride along with the samples they label, so the page needs
+        // no second request. Names only: targets and assignments stay behind
+        // `Admin`. Skipped when the probes were not asked for -- the resources
+        // tab has nothing to label, and this is a turn at the write connection.
+        let probes =
+            if want_ping { app.db.ping_task_names(id).unwrap_or_else(|_| json!({})) } else { json!({}) };
+        let metrics = if want_metrics { app.db.metrics(id, since, step)? } else { vec![] };
         // `loss` is per probe across the whole window, beside the per-bucket
         // `loss` on the rows. Both are needed and neither replaces the other:
         // the row figure is what a tooltip reads, and the window figure is the
         // only one that can be right, because the denominators it divides by
         // are gone by the time the rows are built. Additive, so a theme that
         // has never heard of it keeps working.
-        (Ok(m), Ok((p, loss))) => {
-            Json(json!({"metrics": m, "ping": p, "probes": probes, "loss": loss})).into_response()
-        }
-        (Err(e), _) | (_, Err(e)) => fail(e),
+        let (ping, loss) =
+            if want_ping { app.db.ping_records(id, since, step)? } else { (vec![], json!({})) };
+        anyhow::Ok(json!({"metrics": metrics, "ping": ping, "probes": probes, "loss": loss}))
+    })
+    .await;
+    match built.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
+        Ok(body) => Json(body).into_response(),
+        Err(e) => fail(e),
     }
 }
 
@@ -1510,7 +1577,10 @@ pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task):
             agent_ws::push_ping_tasks(&app);
             Json(json!({"id": id})).into_response()
         }
-        Err(e) => fail(e),
+        // Every way this fails is something the caller sent: a node id that is
+        // not there, or more probes on one node than the agent will run. Same
+        // reasoning as `reorder_nodes`.
+        Err(e) => bad(&e.to_string()),
     }
 }
 
@@ -3020,6 +3090,78 @@ mod tests {
         // The live entry went with the connection, so "offline since" has to
         // come off the node row.
         assert_eq!(view["last_seen"], 1_700_000_000);
+    }
+
+    /// A capacity arrives twice -- once in the facts stored at the handshake,
+    /// and again in every report -- and the two come apart as soon as a disk is
+    /// mounted on a running machine, which the agent re-reads its mount table
+    /// every sample to notice. Drawn from the stored copy, the card and the
+    /// detail page showed the same box two different sizes until it reconnected.
+    #[test]
+    fn a_capacity_that_changed_since_the_handshake_is_the_reported_one() {
+        let app = app();
+        let id = node(&app, "n", true);
+        // What the handshake stored: 30 GB of disk, 1 GB of swap.
+        app.db
+            .save_facts(
+                id,
+                &json!({"mem_total": 1_000, "swap_total": 1i64 << 30, "disk_total": 30i64 << 30}),
+                "ip",
+            )
+            .unwrap();
+
+        let offline = &visible_nodes(&app, true).unwrap()[0];
+        assert_eq!(
+            offline["disk_total"],
+            30i64 << 30,
+            "with nobody connected the stored facts are all there is"
+        );
+
+        // A 5 GB volume is mounted and the swap is turned off. Same session:
+        // no second hello, so the stored facts do not move.
+        let _held = connect(
+            &app,
+            id,
+            json!({"mem_total": 1_000, "swap_total": 0, "disk_total": 35i64 << 30, "cpu": 1.0}),
+        );
+        let live = &visible_nodes(&app, true).unwrap()[0];
+        assert_eq!(live["disk_total"], 35i64 << 30, "the report is the truth while the agent is connected");
+        assert_eq!(live["swap_total"], 0, "swapoff means zero, not the gigabyte that was there at connect");
+        assert_eq!(live["disk_total"], live["metrics"]["disk_total"], "one number, not two");
+        assert_eq!(app.db.node(id).unwrap().unwrap().disk_total, 30i64 << 30, "and no extra write to get it");
+    }
+
+    /// `PUBLIC_HOURS` bounds one window; this bounds how many are built at
+    /// once. Each holds the connection the agents report through for its whole
+    /// scan, and the path takes no credentials -- the same shape `RELAY_GATE`
+    /// and `PASSWORD_GATE` already hold on the other two anonymous ways to make
+    /// this process work hard.
+    #[tokio::test]
+    async fn history_queries_past_the_gate_are_refused_rather_than_queued() {
+        let app = std::sync::Arc::new(app());
+        let id = node(&app, "n", true);
+        let ask = || {
+            metrics(
+                State(app.clone()),
+                HeaderMap::new(),
+                Path(id),
+                Query(Window { hours: 1, points: None, series: None }),
+            )
+        };
+
+        let held: Vec<_> =
+            (0..HISTORY_SLOTS).map(|_| HISTORY_GATE.try_acquire().expect("up to the limit")).collect();
+        assert_eq!(ask().await.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(held);
+        assert_eq!(ask().await.status(), StatusCode::OK, "a finished query gives its slot back");
+
+        // A caller with no business here hears that, not "come back later":
+        // the gate sits behind the visibility check on purpose.
+        app.db.set("public_page", "off").unwrap();
+        let held: Vec<_> =
+            (0..HISTORY_SLOTS).map(|_| HISTORY_GATE.try_acquire().expect("up to the limit")).collect();
+        assert_eq!(ask().await.status(), StatusCode::UNAUTHORIZED);
+        drop(held);
     }
 
     /// A settings write lands whole or not at all. Changing the password

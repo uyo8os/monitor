@@ -2420,6 +2420,21 @@ impl Db {
             .collect()
     }
 
+    /// The most probes one node may be assigned.
+    ///
+    /// This number belongs to the agent: `MAX_PING_TASKS` in that repository
+    /// caps the list it will run, because a hub that is compromised or merely
+    /// buggy could otherwise ask someone else's VPS for hundreds of outbound
+    /// connects a second. That cap is a defence and stays, but it is also the
+    /// *only* thing enforcing the limit -- the agent truncates in silence,
+    /// leaving one line in that machine's own journal, and the hub goes on
+    /// pushing probes that never run and drawing charts that stay empty.
+    ///
+    /// The hub is the side that knows how many there are, so the hub is the
+    /// side that refuses. Keep the two in step; the agent's copy is the
+    /// backstop, not the message.
+    const MAX_PROBES_PER_NODE: i64 = 64;
+
     /// The assignments are replaced wholesale, so they go in one transaction:
     /// failing between the delete and the inserts would unassign every node
     /// from a probe the panel still lists them under.
@@ -2442,6 +2457,24 @@ impl Db {
         tx.execute("DELETE FROM ping_node WHERE task_id=?1", [id])?;
         for node in &t.nodes {
             tx.execute("INSERT INTO ping_node (task_id, node_id) VALUES (?1,?2)", params![id, node])?;
+        }
+        // Asked of the table after the rows are in, rather than counted from
+        // the request: an update replaces this task's own assignments, so
+        // arithmetic on the way in would have to subtract them back out. The
+        // transaction is where this is atomic with the write, and bailing here
+        // rolls it back.
+        let crowded: Option<i64> = tx
+            .query_row(
+                "SELECT node_id FROM ping_node GROUP BY node_id HAVING COUNT(*) > ?1 LIMIT 1",
+                [Self::MAX_PROBES_PER_NODE],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(node) = crowded {
+            anyhow::bail!(
+                "节点 {node} 会被分配超过 {} 个探测任务，agent 最多只跑这么多，多出来的会被静默丢掉",
+                Self::MAX_PROBES_PER_NODE
+            );
         }
         tx.commit()?;
         Ok(id)
@@ -2466,11 +2499,18 @@ impl Db {
     }
 
     /// The task list to push to one agent.
+    ///
+    /// Ordered, because the agent keeps the first [`Self::MAX_PROBES_PER_NODE`]
+    /// as its backstop against a hub asking for hundreds. Unordered, a list at
+    /// that edge could hand it a different subset on each push, restarting half
+    /// the timers every time; `save_ping_task` refuses to reach the edge, and
+    /// this makes the backstop deterministic if a database ever arrives there
+    /// another way.
     pub fn ping_tasks_for(&self, node_id: i64) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT t.id, t.target, t.interval FROM ping_task t
-             JOIN ping_node n ON n.task_id = t.id WHERE n.node_id = ?1",
+             JOIN ping_node n ON n.task_id = t.id WHERE n.node_id = ?1 ORDER BY t.id",
         )?;
         let rows = stmt.query_map([node_id], |r| {
             Ok(serde_json::json!({
@@ -3947,6 +3987,41 @@ mod tests {
         .unwrap();
         assert_eq!(db.ping_tasks_for(b).unwrap().len(), 0);
         assert_eq!(db.ping_tasks().unwrap()[0].interval, 30);
+    }
+
+    /// The agent caps the probe list it will run and drops the rest with
+    /// nothing but a line in its own journal. The hub is the side that knows
+    /// how many there are, so it is the side that has to say no -- otherwise
+    /// the panel lists probes that never ran and charts that stay empty, and
+    /// the only record of why is on the node.
+    #[test]
+    fn a_node_cannot_be_given_more_probes_than_the_agent_will_run() {
+        let db = db();
+        let id = node(&db, 1);
+        let save = |task: i64, nodes: Vec<i64>| {
+            db.save_ping_task(&PingTask {
+                id: task,
+                name: "p".into(),
+                target: "1.1.1.1:443".into(),
+                interval: 60,
+                nodes,
+            })
+        };
+        for _ in 0..Db::MAX_PROBES_PER_NODE {
+            save(0, vec![id]).unwrap();
+        }
+        assert_eq!(db.ping_tasks_for(id).unwrap().len() as i64, Db::MAX_PROBES_PER_NODE);
+
+        let refused = save(0, vec![id]).expect_err("one past the cap must be refused");
+        assert!(refused.to_string().contains("探测任务"), "{refused}");
+        // Rolled back whole: the probe itself must not survive its assignment
+        // being rejected, or the panel grows one that nothing ever runs.
+        assert_eq!(db.ping_tasks().unwrap().len() as i64, Db::MAX_PROBES_PER_NODE);
+        assert_eq!(db.ping_tasks_for(id).unwrap().len() as i64, Db::MAX_PROBES_PER_NODE);
+
+        // Editing one that is already there is not adding one.
+        let first = db.ping_tasks().unwrap()[0].id;
+        save(first, vec![id]).expect("an existing probe can still be edited at the cap");
     }
 }
 
