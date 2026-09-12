@@ -45,9 +45,7 @@ cargo build --release
 ## 安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/uyo8os/monitor/main/install-hub.sh -o install-hub.sh
-chmod +x install-hub.sh
-sudo ./install-hub.sh
+curl -fsSL https://raw.githubusercontent.com/uyo8os/monitor/main/install-hub.sh -o install-hub.sh && chmod +x install-hub.sh && ./install-hub.sh
 ```
 
 有终端时给一个菜单（安装 / 升级、卸载、状态、日志）；`curl ... | sh` 没有终端可读答案，直接按默认装。
