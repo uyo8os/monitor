@@ -143,8 +143,10 @@ GitHub 代理（如 `https://ghfast.top`），hub 拉 release 时会用它，节
 ```bash
 docker run -d --name monitor -p 28080:28080 \
   -v monitor-data:/data -e TZ=Asia/Shanghai \
-  ghcr.io/monitor-probe/monitor
+  stqfdyr/monitor
 ```
+
+同一份镜像也发在 `ghcr.io/monitor-probe/monitor`，两个地址内容一致，每个 tag 由同一次构建推上去。
 
 `FROM scratch` 里放同一个 musl 二进制加一份 zoneinfo，约 10 MB，以 uid 65534 运行，数据库和主题
 目录都在 `/data`。首次启动的应急密码在 `docker logs monitor` 里。

@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{Datelike, Local, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -1006,7 +1006,10 @@ impl Db {
         };
         tx.execute("DELETE FROM ping_node WHERE task_id=?1", [id])?;
         for node in &t.nodes {
-            tx.execute("INSERT INTO ping_node (task_id, node_id) VALUES (?1,?2)", params![id, node])?;
+            // The foreign key is the check; naming the node turns SQLite's
+            // "FOREIGN KEY constraint failed" into something the panel can show.
+            tx.execute("INSERT INTO ping_node (task_id, node_id) VALUES (?1,?2)", params![id, node])
+                .with_context(|| format!("节点 {node} 不存在"))?;
         }
         // Queried from the table after the rows are in rather than counted from
         // the request: an update replaces this task's own assignments, so

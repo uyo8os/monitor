@@ -282,10 +282,61 @@ UNIT
 	if [ -z "$SITE" ]; then
 		printf '  %s还差一步：配个反向代理%s\n' "$B" "$N"
 		printf '     面板只监听本机，公网访问不到——这是故意的，凭证不会在链路上裸奔。\n'
-		printf '     用 nginx / caddy / cf tunnel 等配置完反向代理后，用域名访问面板，\n'
-		printf '     我相信这难不倒你。\n\n'
-		printf '     %s完整配置和注意事项见 README 的「反向代理」一节。%s\n' "$D" "$N"
+		printf '     用 nginx / caddy / cf tunnel 任选一种，把 hub.example.com 换成你的域名，\n'
+		printf '     配好之后用域名访问面板，我相信这难不倒你。\n\n'
+		proxy_configs
+		printf '\n     %s四点注意与完整说明见 README 的「反向代理」一节。%s\n' "$D" "$N"
 	fi
+}
+
+# The three configurations, printed where they are needed rather than described:
+# the hub is unreachable until one of them is in place, so an installer that
+# stops at "put a proxy in front of it" leaves the install half done.
+#
+# The heredocs are unquoted so $PORT lands in them; every variable belonging to
+# the proxy is escaped, since nginx and caddy read those themselves.
+proxy_configs() {
+	printf '  %scaddy%s  Caddyfile\n' "$B" "$N"
+	cat <<CADDY
+hub.example.com {
+    reverse_proxy 127.0.0.1:$PORT
+}
+CADDY
+	printf '\n  %snginx%s  /etc/nginx/sites-available/hub.example.com\n' "$B" "$N"
+	cat <<NGINX
+map \$http_upgrade \$connection_upgrade { default upgrade; '' close; }
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name hub.example.com;
+    ssl_certificate     /etc/letsencrypt/live/hub.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/hub.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:$PORT;
+        proxy_http_version 1.1;
+        # 导入备份与上传主题是分片传的，单片 4 MiB；这个数不随数据库增长。
+        client_max_body_size 8m;
+        proxy_set_header Host              \$host;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        # /api/agent/ws 与 /api/ws 是长连接。
+        proxy_set_header Upgrade    \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_buffering off;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+    }
+}
+NGINX
+	printf '\n  %scloudflare 隧道%s  config.yml（不用开任何入站端口）\n' "$B" "$N"
+	cat <<CFD
+ingress:
+  - hostname: hub.example.com
+    service: http://127.0.0.1:$PORT
+  - service: http_status:404
+CFD
 }
 
 # ---- uninstall ----
