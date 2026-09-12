@@ -118,9 +118,26 @@ aarch64 | arm64) ARCH=aarch64 ;;
 *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 
-# --register trades a key for this node's own token, which is what lets one
-# command set up a batch of machines. The key is only good inside the window
-# the panel opened, and never becomes the credential the agent runs with.
+# The hub relays the binary, so a node need only reach the hub it already talks
+# to: an IPv6-only or blocked machine cannot resolve github.com. A hub unable to
+# fetch releases itself is configured with a GitHub proxy in its own settings,
+# which is why none is requested here.
+URL="${SERVER%/}/agent/$ARCH"
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+
+echo "downloading monitor-agent ($ARCH)"
+curl -fsSL "$URL" -o "$TMP"
+
+# Downloaded before the registration below, because that step spends a node: the
+# key returns a token and the panel gains a row, while the env file recording it
+# is only written once the binary is in place. A download that fails after
+# registering therefore leaves an unusable node behind, and the rerun -- the
+# documented way to recover -- registers a second one.
+#
+# --register exchanges a key for this node's own token, which is what allows one
+# command to provision a batch of machines. The key is valid only within the
+# window the panel opened and never becomes the credential the agent runs with.
 if [ -z "$TOKEN" ]; then
 	# Re-running the same command must not add a second node. This machine's
 	# token is already here, and it outlives the window that issued it, so the
@@ -150,17 +167,6 @@ if [ -z "$TOKEN" ]; then
 		exit 1
 	}
 fi
-
-# The hub relays the binary, so a node only has to reach the hub it already
-# talks to -- an IPv6-only or blocked machine never resolves github.com at all.
-# A hub that cannot fetch releases itself points at a GitHub proxy in its own
-# settings, which is why no proxy is asked for here.
-URL="${SERVER%/}/agent/$ARCH"
-TMP="$(mktemp)"
-trap 'rm -f "$TMP"' EXIT
-
-echo "downloading monitor-agent ($ARCH)"
-curl -fsSL "$URL" -o "$TMP"
 
 # Stop an agent already running here before replacing its binary. The service
 # name is fixed, so a reinstall was never going to start a second copy, but

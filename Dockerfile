@@ -21,7 +21,10 @@ ENV TZ=UTC
 # Nothing in this image can mkdir -- no shell, and the hub runs unprivileged --
 # so /data is baked in already owned. The hub creates themes/ under it itself.
 COPY --from=base --chown=65534:65534 /data /data
-COPY --chown=65534:65534 monitor-hub-$TARGETARCH /monitor-hub
+# --chmod, because the executable bit does not survive the round trip through
+# actions/upload-artifact: without it the image carries a 0644 binary and every
+# container exits at exec with "permission denied".
+COPY --chmod=0755 --chown=65534:65534 monitor-hub-$TARGETARCH /monitor-hub
 USER 65534:65534
 
 EXPOSE 28080
