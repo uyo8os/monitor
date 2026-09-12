@@ -23,7 +23,7 @@
 | 仓库 | 说明 |
 |---|---|
 | [monitor](https://github.com/uyo8os/monitor) | hub：后台、API、公开页宿主 |
-| [agent](https://github.com/monitor-agent) | Linux agent |
+| [agent](https://github.com/uyo8os/monitor-agent) | Linux agent |
 | [monitor-theme-default](https://github.com/uyo8os/monitor-theme-default) | 内置默认主题 |
 
 ```

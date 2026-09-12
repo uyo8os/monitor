@@ -10,14 +10,14 @@
 | [architecture.md](architecture.md) | 第一次接触这个项目。组件、数据流、线上协议、数据模型 |
 | [decisions.md](decisions.md) | **动手改之前必读。** 每个选择的理由，以及被否决的方案 |
 | [traffic.md](traffic.md) | 碰流量相关代码之前。这是项目的核心特性，有一个不变量必须守住 |
-| [data-accuracy.md](https://github.com/monitor-agent/blob/main/docs/data-accuracy.md) | 碰 agent 采集代码之前。内存/硬盘/CPU 的口径和验证方法 |
+| [data-accuracy.md](https://github.com/uyo8os/monitor-agent/blob/main/docs/data-accuracy.md) | 碰 agent 采集代码之前。内存/硬盘/CPU 的口径和验证方法 |
 | [security.md](security.md) | 碰鉴权、API 边界、公开页之前 |
 | [development.md](development.md) | 要构建、测试、本地跑起来 |
 | [benchmark.md](benchmark.md) | 想知道跑得有多省。横向对比的实测数字，也是调优改动的记录 |
 
 ## 30 秒版本
 
-服务器探针的 hub。agent 在 [另一个仓库](https://github.com/monitor-agent)。负责状态、流量、延迟、成本与 Telegram 通知。
+服务器探针的 hub。agent 在 [另一个仓库](https://github.com/uyo8os/monitor-agent)。负责状态、流量、延迟、成本与 Telegram 通知。
 
 - **agent** 只跑 Linux，直接读 `/proc` 和 `statvfs`，无状态、不落盘
 - **hub** 是 axum + SQLite，前端构建产物嵌进二进制，零配置文件启动
@@ -33,7 +33,7 @@
    [traffic.md](traffic.md)
 2. **内存和硬盘的数字必须和 `free` / `df` 对得上。** 现成的写法在这两个数上口径都不对，错得又看
    不出来。这一条唯一能被违反的地方在 agent，那边叫「口径铁律」，hub 只是转发。见
-   [data-accuracy.md](https://github.com/monitor-agent/blob/main/docs/data-accuracy.md)
+   [data-accuracy.md](https://github.com/uyo8os/monitor-agent/blob/main/docs/data-accuracy.md)
 3. **公开状态页永远不输出 IP、主机名和备注。** 见 [security.md](security.md)
 
 ## 明确不做的
