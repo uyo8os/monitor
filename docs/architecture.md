@@ -14,7 +14,7 @@
 | 仓库 | 内容 |
 |---|---|
 | **monitor**（本仓库） | hub + 内置后台 + `install.sh` |
-| **[agent](https://github.com/stqfdyr/agent)** | Linux agent。发布自己的 musl 二进制，`install.sh` 从那边的 release 拉 |
+| **[agent](https://github.com/monitor-agent)** | Linux agent。发布自己的 musl 二进制，`install.sh` 从那边的 release 拉 |
 | **[monitor-theme-default](https://github.com/uyo8os/monitor-theme-default)** | 默认公开页主题。**发布构建产物**（`theme.tar.gz` = `dist/` + `theme.json`），hub 按 `web-theme.pin` 下载校验后嵌入 |
 
 agent 拆开是因为部署机器和发布节奏不同。默认主题拆开是为了让主题拥有独立契约、版本和开发流程，
@@ -41,7 +41,7 @@ agent 拆开是因为部署机器和发布节奏不同。默认主题拆开是�
 | `web-admin/src/` | ~2290 | 内置后台。`components/ui/` 下是 shadcn 生成的，不手改 |
 | `scripts/theme.sh` | ~50 | 按 `web-theme.pin` 下载、校验、解出默认主题到 `target/theme/`。build.rs 和 CI 都调它 |
 
-agent 的采集代码在 [另一个仓库](https://github.com/stqfdyr/agent)。改了它的上报字段就是改了协议，两边要同步。
+agent 的采集代码在 [另一个仓库](https://github.com/monitor-agent)。改了它的上报字段就是改了协议，两边要同步。
 
 ## 线上协议
 
@@ -57,7 +57,7 @@ WebSocket 承载 **JSON-RPC 2.0 通知**（只有 `method` + `params`，没有 `
 | `report` | `Metrics`：见下 | 每 `interval` 秒 |
 | `ping.result` | `{task_id, latency_ms}`，`latency_ms` 为 `-1` 表示连不上 | 每个探测任务按自己的间隔 |
 
-`Metrics` 的字段（[agent 仓库](https://github.com/stqfdyr/agent) 里 `src/collect.rs` 的 `Metrics` struct 就是权威定义）：
+`Metrics` 的字段（[agent 仓库](https://github.com/monitor-agent) 里 `src/collect.rs` 的 `Metrics` struct 就是权威定义）：
 
 ```
 boot_id  uptime  cpu  load[3]

@@ -22,7 +22,7 @@
 
 `?token=xxx` 是更省事的写法，但 query string 会进 nginx/caddy 的 access log。agent 不是浏览器，能设请求头，所以没有理由把 token 放 URL 里。
 
-改动位置：[agent 仓库](https://github.com/stqfdyr/agent) 的 `src/main.rs` 的 `session()`，`src/agent_ws.rs` 的 `bearer()`。
+改动位置：[agent 仓库](https://github.com/monitor-agent) 的 `src/main.rs` 的 `session()`，`src/agent_ws.rs` 的 `bearer()`。
 
 ---
 

@@ -925,7 +925,7 @@ mod tests {
     fn a_github_proxy_prefixes_the_release_url_and_an_empty_one_does_not() {
         let app = app("");
         let direct = release_url(&app, "x86_64");
-        assert!(direct.starts_with("https://github.com/stqfdyr/agent/releases/"), "{direct}");
+        assert!(direct.starts_with("https://github.com/monitor-agent/releases/"), "{direct}");
 
         for set in ["https://ghfast.top", "https://ghfast.top/", "  https://ghfast.top/  "] {
             app.db.set("github_proxy", set).unwrap();

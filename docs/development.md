@@ -127,7 +127,7 @@ cd web-admin && npm run dev
 名叫 `theme.tar.gz` 的资产，tag 写成 `v<theme.json 里的 version>`（`v` 可有可无）。hub 比 tag 和已装
 版本，相同就不下载。资产必须叫这个名字——hub 不取 release 里的第一个资产。
 
-登录后建一个节点，拿到 token，在 [agent 仓库](https://github.com/stqfdyr/agent) 里跑一个指向本机
+登录后建一个节点，拿到 token，在 [agent 仓库](https://github.com/monitor-agent) 里跑一个指向本机
 hub 的 agent：
 
 ```bash
