@@ -92,7 +92,7 @@ function Addresses({ node }: { node: Node }) {
   // Old agents can leave a private interface address in the database. Only
   // render routable addresses; the hub-observed connection source is already
   // among the candidates and supplies the public fallback behind local nginx.
-  const list = publicAddresses
+  const list = [...publicAddresses].sort((a, b) => Number(a.includes(":")) - Number(b.includes(":")))
   if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
   return (
     <div className="flex flex-col items-start gap-y-0.5">
