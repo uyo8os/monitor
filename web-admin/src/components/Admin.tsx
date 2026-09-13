@@ -54,13 +54,45 @@ function compactAddress(address: string) {
   return `${value.slice(0, 10)}...${value.slice(-3)}`
 }
 
+function isPublicAddress(address: string) {
+  const value = address.trim().toLowerCase()
+  const octets = value.split(".").map(Number)
+  if (octets.length === 4 && octets.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)) {
+    const [a, b, c] = octets
+    return !(a === 0
+      || a === 10
+      || a === 127
+      || (a === 100 && b >= 64 && b <= 127)
+      || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 0 && (c === 0 || c === 2))
+      || (a === 192 && b === 168)
+      || (a === 198 && (b === 18 || b === 19))
+      || (a === 198 && b === 51 && c === 100)
+      || (a === 203 && b === 0 && c === 113)
+      || a >= 224)
+  }
+  if (!value.includes(":")) return false
+  if (value.startsWith("::ffff:")) return isPublicAddress(value.slice(7))
+  return value !== "::"
+    && value !== "::1"
+    && !value.startsWith("fc")
+    && !value.startsWith("fd")
+    && !/^fe[89ab]/.test(value)
+    && !/^fe[c-f]/.test(value)
+    && !value.startsWith("ff")
+    && !value.startsWith("2001:db8")
+}
+
 // Every address a node has, each click-to-copy: pasting one into an ssh
 // command is the reason it is shown at all.
 function Addresses({ node }: { node: Node }) {
-  const reported = [node.ipv4, node.ipv6].filter(Boolean) as string[]
-  // `ip` is only where the agent's connection came from: the fallback for an
-  // agent too old to report its own interfaces.
-  const list = reported.length ? reported : ([node.ip].filter(Boolean) as string[])
+  const candidates = [...new Set([node.ipv4, node.ipv6, node.ip].filter(Boolean) as string[])]
+  const publicAddresses = candidates.filter(isPublicAddress)
+  // Old agents can leave a private interface address in the database. Only
+  // render routable addresses; the hub-observed connection source is already
+  // among the candidates and supplies the public fallback behind local nginx.
+  const list = publicAddresses
   if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
   return (
     <div className="flex flex-col items-start gap-y-0.5">
