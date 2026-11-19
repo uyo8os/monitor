@@ -28,7 +28,7 @@ export function useVersions() {
   return { versions, reload: load }
 }
 
-const releaseUrl = (repo: string, version: string) => `https://github.com/monitor-probe/${repo}/releases/tag/v${version}`
+const releaseUrl = (repo: string, version: string) => `https://github.com/uyo8os/${repo}/releases/tag/v${version}`
 
 /** `v1.2.0 → v1.3.0` when something is published, the running version alone otherwise. */
 function VersionPair({ current, latest }: { current: string; latest: string }) {
@@ -138,7 +138,7 @@ export function Update({ versions, reload, nodes, site, refusal }: {
                   </Button>
                   {versions.agent_latest && (
                     <Button size="sm" variant="ghost" asChild>
-                      <a href={releaseUrl("agent", versions.agent_latest)} target="_blank" rel="noreferrer">
+                      <a href={releaseUrl("monitor-agent", versions.agent_latest)} target="_blank" rel="noreferrer">
                         发布说明
                       </a>
                     </Button>
