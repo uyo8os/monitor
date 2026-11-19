@@ -2,7 +2,7 @@
 # its own: a from-source stage would have to repeat the panel build,
 # scripts/theme.sh and cross, and would then drift from the binary CI actually
 # ships. Put monitor-hub-amd64 / monitor-hub-arm64 beside this file to build it
-# by hand; otherwise pull ghcr.io/uyo8os/monitor.
+# by hand, then build and publish the image to your chosen registry.
 
 # Pinned to the build platform because zoneinfo is arch-independent data, which
 # is what keeps a two-platform build from needing QEMU.
