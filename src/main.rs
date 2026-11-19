@@ -52,6 +52,12 @@ use db::Db;
 
 pub type Shared = Arc<App>;
 
+/// A USD-based exchange-rate snapshot, retained in memory until the hub restarts.
+pub struct FxSnapshot {
+    pub rates: HashMap<String, f64>,
+    pub fetched_at: i64,
+}
+
 pub struct App {
     pub db: Db,
     /// Every connected agent: its outbound channel, the session that opened it,
@@ -86,6 +92,7 @@ pub struct App {
     /// asks rather than on a timer, so a hub nobody opens makes no outbound
     /// request; see `api::versions`.
     pub releases: Mutex<Releases>,
+    pub fx: Mutex<Option<FxSnapshot>>,
 }
 
 #[derive(Default, Clone)]
@@ -114,6 +121,7 @@ impl App {
             themes,
             notes,
             releases: Mutex::default(),
+            fx: Mutex::default(),
         }
     }
 
@@ -675,6 +683,8 @@ fn router(app: Shared) -> Router {
         .route("/api/sessions", get(api::sessions))
         .route("/api/sessions/{id}", delete(api::delete_session))
         .route("/api/settings", get(api::settings).put(api::save_settings))
+        .route("/api/cost/fx", get(api::fx))
+        .route("/api/cost/fx/refresh", post(api::refresh_fx))
         .route("/api/version", get(api::versions))
         .route("/api/notify/test", post(notify::test))
         .route("/api/themes", get(api::themes))
@@ -1163,6 +1173,8 @@ mod tests {
         );
         assert_eq!(send("POST", "/api/auth/login", over, "same-origin").await, too_large);
         assert_eq!(send("POST", "/api/auth/login", form, "same-site").await, refused);
+        assert_eq!(send("GET", "/api/cost/fx", 0, "same-origin").await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(send("POST", "/api/cost/fx/refresh", 0, "same-origin").await.0, StatusCode::UNAUTHORIZED);
         assert_eq!(
             send("GET", "/api/nope", 0, "same-origin").await,
             (StatusCode::NOT_FOUND, "没有这个接口：/api/nope".into())

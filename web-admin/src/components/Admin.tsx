@@ -1,8 +1,9 @@
-import { ArrowUpCircle, Bell, Database, Palette, Radio, Server, Settings, Shield } from "lucide-react"
+import { ArrowUpCircle, Bell, CircleDollarSign, Database, Palette, Radio, Server, Settings, Shield } from "lucide-react"
 import { useEffect, useRef } from "react"
 
 import { behind, type Node, outdatedAgents } from "@/lib/api"
 import { Data } from "@/pages/Data"
+import { Cost } from "@/pages/Cost"
 import { Nodes } from "@/pages/Nodes"
 import { Notify } from "@/pages/Notify"
 import { Ping } from "@/pages/Ping"
@@ -15,6 +16,7 @@ import { Update, useVersions } from "@/pages/Update"
 // reload returns to the same section.
 const ADMIN_SECTIONS = [
   { path: "/admin/nodes", label: "节点", icon: Server },
+  { path: "/admin/cost", label: "成本", icon: CircleDollarSign },
   { path: "/admin/ping", label: "延迟", icon: Radio },
   { path: "/admin/notify", label: "通知", icon: Bell },
   { path: "/admin/data", label: "数据", icon: Database },
@@ -86,7 +88,9 @@ export function Admin({
       </nav>
 
       <div className="min-w-0 flex-1">
-        {path === "/admin/ping" ? (
+        {path === "/admin/cost" ? (
+          <Cost nodes={nodes} />
+        ) : path === "/admin/ping" ? (
           <Ping nodes={nodes} />
         ) : path === "/admin/notify" ? (
           <Notify nodes={nodes} refresh={refresh} />

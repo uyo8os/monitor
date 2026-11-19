@@ -1,5 +1,6 @@
 //! The panel and public-status HTTP surface.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use axum::extract::rejection::JsonRejection;
@@ -20,7 +21,97 @@ use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
 };
 use crate::db::{self, Db, Node, NodePatch, PingTask, Traffic, TrafficPatch};
-use crate::{agent_ws, App, Shared};
+use crate::{agent_ws, App, FxSnapshot, Shared};
+
+// A fixed upstream prevents the refresh endpoint becoming a proxy for arbitrary URLs.
+const FX_URL: &str = "https://api.frankfurter.dev/v1/latest?base=USD";
+const FX_LATEST_MAX_AGE: i64 = 72 * 3_600;
+const FX_CACHED_MAX_AGE: i64 = 7 * 86_400;
+
+#[derive(Deserialize)]
+struct FrankfurterResponse {
+    base: String,
+    rates: HashMap<String, f64>,
+}
+
+fn fx_status(fetched_at: i64) -> &'static str {
+    let age = Utc::now().timestamp().saturating_sub(fetched_at).max(0);
+    match age {
+        0..=FX_LATEST_MAX_AGE => "latest",
+        age if age <= FX_CACHED_MAX_AGE => "cached",
+        _ => "expired",
+    }
+}
+
+fn fx_json(snapshot: Option<&FxSnapshot>) -> Value {
+    match snapshot {
+        None => {
+            json!({"status": "unavailable", "provider": "Frankfurter", "base_currency": "USD", "fetched_at": null, "rates": {}})
+        }
+        Some(snapshot) => json!({
+            "status": fx_status(snapshot.fetched_at),
+            "provider": "Frankfurter",
+            "base_currency": "USD",
+            "fetched_at": DateTime::from_timestamp(snapshot.fetched_at, 0).map(|date| date.to_rfc3339()),
+            "rates": snapshot.rates,
+        }),
+    }
+}
+
+async fn fetch_fx(app: &App) -> anyhow::Result<FxSnapshot> {
+    const MAX_FX_BYTES: usize = 64 * 1024;
+    let mut response = app.http.get(FX_URL).send().await?.error_for_status()?;
+    anyhow::ensure!(
+        response.content_length().is_none_or(|len| len <= MAX_FX_BYTES as u64),
+        "exchange-rate response too large"
+    );
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(
+            chunk.len() <= MAX_FX_BYTES.saturating_sub(body.len()),
+            "exchange-rate response too large"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    let payload: FrankfurterResponse = serde_json::from_slice(&body)?;
+    validate_fx(payload)
+}
+
+fn validate_fx(payload: FrankfurterResponse) -> anyhow::Result<FxSnapshot> {
+    anyhow::ensure!(payload.base.eq_ignore_ascii_case("USD"), "unexpected exchange-rate base");
+    let mut rates = HashMap::from([("USD".to_string(), 1.0)]);
+    for (currency, rate) in payload.rates {
+        let currency = currency.trim().to_ascii_uppercase();
+        if currency != "USD"
+            && currency.len() == 3
+            && currency.bytes().all(|b| b.is_ascii_alphabetic())
+            && rate.is_finite()
+            && rate > 0.0
+        {
+            rates.insert(currency, rate);
+        }
+    }
+    anyhow::ensure!(rates.contains_key("CNY"), "exchange rates did not include CNY");
+    Ok(FxSnapshot { rates, fetched_at: Utc::now().timestamp() })
+}
+
+pub async fn fx(_: Admin, State(app): State<Shared>) -> Json<Value> {
+    let cache = app.fx.lock().unwrap_or_else(|e| e.into_inner());
+    Json(fx_json(cache.as_ref()))
+}
+
+pub async fn refresh_fx(_: Admin, State(app): State<Shared>) -> Response {
+    let snapshot = match fetch_fx(&app).await {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            warn!("exchange-rate refresh failed: {e:#}");
+            return answer(StatusCode::BAD_GATEWAY, "汇率服务暂不可用，请稍后重试");
+        }
+    };
+    let mut cache = app.fx.lock().unwrap_or_else(|e| e.into_inner());
+    *cache = Some(snapshot);
+    Json(fx_json(cache.as_ref())).into_response()
+}
 
 /// Present only on requests carrying a valid session. Handlers taking it cannot
 /// be reached unauthenticated, so the check cannot be omitted.
@@ -2422,6 +2513,32 @@ mod tests {
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
+    }
+
+    #[test]
+    fn exchange_rate_snapshot_reports_its_age() {
+        let now = Utc::now().timestamp();
+        assert_eq!(fx_json(None)["status"], "unavailable");
+        let mut snapshot = FxSnapshot { rates: HashMap::from([("USD".into(), 1.0)]), fetched_at: now };
+        assert_eq!(fx_json(Some(&snapshot))["status"], "latest");
+        snapshot.fetched_at = now - FX_LATEST_MAX_AGE - 60;
+        assert_eq!(fx_json(Some(&snapshot))["status"], "cached");
+        snapshot.fetched_at = now - FX_CACHED_MAX_AGE - 60;
+        assert_eq!(fx_json(Some(&snapshot))["status"], "expired");
+    }
+
+    #[test]
+    fn exchange_rates_validate_base_and_values() {
+        let rates = HashMap::from([
+            ("USD".into(), 9.0),
+            (" cny ".into(), 7.0),
+            ("BAD!".into(), 1.0),
+            ("EUR".into(), -1.0),
+        ]);
+        let snapshot = validate_fx(FrankfurterResponse { base: "USD".into(), rates }).unwrap();
+        assert_eq!(snapshot.rates, HashMap::from([("USD".into(), 1.0), ("CNY".into(), 7.0)]));
+        assert!(validate_fx(FrankfurterResponse { base: "EUR".into(), rates: HashMap::new() }).is_err());
+        assert!(validate_fx(FrankfurterResponse { base: "USD".into(), rates: HashMap::new() }).is_err());
     }
 
     fn peer() -> ConnectInfo<std::net::SocketAddr> {
