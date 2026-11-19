@@ -10,6 +10,15 @@
 
 Agent 签名使用新密钥时，须将匹配的 Ed25519 公钥同时更新到 `monitor/src/main.rs` 和 `monitor-agent/.github/workflows/release.yml`，并在 Agent 仓库的 GitHub Actions secrets 中配置私钥 `AGENT_SIGNING_KEY`。更新 Hub 后再发布 Agent，否则发布校验或 Hub 转发会失败。私钥不得提交到仓库。
 
+## 发布 Hub
+
+发布前先修改 `Cargo.toml` 的版本号，运行 `cargo update --workspace` 同步 `Cargo.lock`，并将 `.github/workflows/release.yml` 中 `version` 输入的 `default` 同步更新为对应标签，然后提交这些文件。版本标签必须与 `Cargo.toml` 一致：例如 `version = "1.5.3"` 对应 `v1.5.3`。
+
+- 推送版本标签：推送代码，再执行 `git tag v1.5.3` 和 `git push origin v1.5.3`。
+- 手动发布：在 GitHub Actions 选择 **Publish release**，点击 **Run workflow**，选择包含版本修改的分支。表单会显示工作流中设置的默认版本；确认它与所选分支 `Cargo.toml` 中的版本一致，例如 `v1.5.3`。
+
+版本必须是 `v数字.数字.数字`，已存在的标签不能指向其他提交，已存在的 Release 会导致发布失败。两种方式都会运行检查和构建，通过后创建最新 Release 并推送容器镜像；如果后续镜像推送失败，Release 可能已经创建，重试前请检查 GitHub 上的状态。GHCR 包需授权本仓库写入。
+
 ## 特性
 
 - 实时监控：秒级实时数据展示

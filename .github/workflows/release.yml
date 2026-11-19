@@ -1,9 +1,19 @@
-name: release
+name: Publish release
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Stable version tag (vX.Y.Z)"
+        required: true
+        default: "v1.5.2"
+        type: string
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+  cancel-in-progress: false
 
 # Read-only by default: the build jobs run third-party actions, dependency
 # build scripts and install hooks, none of which may hold a token that can
@@ -12,20 +22,60 @@ permissions:
   contents: read
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          V=v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            TAG="$INPUT_VERSION"
+          else
+            TAG="$GITHUB_REF_NAME"
+          fi
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::版本必须是 v数字.数字.数字 格式"; exit 1;
+          }
+          [ "$TAG" = "$V" ] || {
+            echo "::error::版本 $TAG 与 Cargo.toml 中的 $V 不一致"; exit 1;
+          }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  check:
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - run: ./scripts/theme.sh
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web-admin/package-lock.json
+      - run: npm ci && npm run lint && npm test && npm run build
+        working-directory: web-admin
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - run: shellcheck -S warning install.sh install-hub.sh scripts/*.sh
+
   build:
+    needs: version
     runs-on: ubuntu-latest
     strategy:
       matrix:
         target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
     steps:
       - uses: actions/checkout@v7
-
-      # A v* tag can be neither moved nor deleted, so one that disagrees with the
-      # version the binary reports stops here, before anything is published.
-      - if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          V=v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
-          [ "$GITHUB_REF_NAME" = "$V" ] || { echo "::error::tag $GITHUB_REF_NAME, Cargo.toml $V"; exit 1; }
 
       # The default theme arrives as a published archive, verified against the
       # hash in web-theme.pin. Run on the runner rather than left to build.rs,
@@ -58,7 +108,7 @@ jobs:
           path: monitor-hub-${{ matrix.target }}
 
   release:
-    needs: build
+    needs: [version, check, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -70,9 +120,27 @@ jobs:
         with:
           path: bin
           merge-multiple: true
-      # A manual dispatch builds and collects the binaries; only a tag publishes,
-      # so the path can be exercised without cutting a release. gh ships on the
-      # runner, keeping a third-party action out of the contents:write step.
+      # Check the remote tag still points to the tested commit. A manual run
+      # may create a missing tag; no run may move an existing tag.
+      - env:
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            git fetch --no-tags origin "refs/tags/$TAG"
+            [ "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$GITHUB_SHA" ] || {
+              echo "::error::标签 $TAG 已指向其他提交，不会移动标签"; exit 1;
+            }
+          else
+            status=$?
+            [ "$status" -eq 2 ] || exit "$status"
+            [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || {
+              echo "::error::触发发布的标签 $TAG 已不存在"; exit 1;
+            }
+            git push origin "$GITHUB_SHA:refs/tags/$TAG"
+          fi
+
+      # gh ships on the runner, keeping a third-party action out of the
+      # contents:write step. --verify-tag refuses to recreate a missing tag.
       #
       # sha256sums.txt is generated from inside bin/ so the names in it are bare
       # asset names, which is what install-hub.sh matches before installing the
@@ -83,14 +151,14 @@ jobs:
       # releases old, and this entry is what lets that copy recognise itself as
       # such. It is published per release rather than read from main, so the
       # script a release was tested with is the one it is measured against.
-      - if: startsWith(github.ref, 'refs/tags/')
-        run: |
+      - run: |
           cp install-hub.sh bin/
           (cd bin && sha256sum monitor-hub-* install-hub.sh > sha256sums.txt)
-          gh release create "$GITHUB_REF_NAME" bin/monitor-hub-* bin/install-hub.sh bin/sha256sums.txt \
-            --generate-notes --repo "$GITHUB_REPOSITORY"
+          gh release create "$TAG" bin/monitor-hub-* bin/install-hub.sh bin/sha256sums.txt \
+            --generate-notes --latest --verify-tag --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
 
       # The image carries the binary this release already published, so the two
       # cannot disagree on what a given tag contains. docker and buildx ship on
@@ -100,12 +168,11 @@ jobs:
       # where `docker run monitor` looks first, ghcr is what the repository
       # publishes alongside its binaries. A fork without the Docker Hub secrets
       # still gets its ghcr image rather than a failed release.
-      - if: startsWith(github.ref, 'refs/tags/')
-        run: |
+      - run: |
           cp bin/monitor-hub-x86_64-unknown-linux-musl monitor-hub-amd64
           cp bin/monitor-hub-aarch64-unknown-linux-musl monitor-hub-arm64
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${TAG#v}"
           IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
           TAGS="-t $IMAGE:$VERSION -t $IMAGE:latest"
           if [ -n "$DOCKERHUB_TOKEN" ]; then
@@ -121,5 +188,6 @@ jobs:
           docker buildx build --platform linux/amd64,linux/arm64 --push $TAGS .
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
