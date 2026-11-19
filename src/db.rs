@@ -129,6 +129,55 @@ CREATE TABLE IF NOT EXISTS node (
 );
 
 -- Monotonic byte counters that survive both agent reboots and hub restarts.
+-- Resource alert rules are separate from connection lifecycle notifications.
+CREATE TABLE IF NOT EXISTS load_rule (
+  id               INTEGER PRIMARY KEY,
+  name             TEXT NOT NULL,
+  metric           TEXT NOT NULL,
+  threshold        REAL NOT NULL,
+  ratio            REAL NOT NULL,
+  interval_minutes INTEGER NOT NULL,
+  enabled          INTEGER NOT NULL DEFAULT 1,
+  default_enabled  INTEGER NOT NULL DEFAULT 0,
+  revision         INTEGER NOT NULL DEFAULT 1,
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS load_rule_node (
+  rule_id INTEGER NOT NULL REFERENCES load_rule(id) ON DELETE CASCADE,
+  node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (rule_id, node_id)
+);
+
+CREATE TABLE IF NOT EXISTS load_alert_state (
+  rule_id               INTEGER NOT NULL REFERENCES load_rule(id) ON DELETE CASCADE,
+  node_id               INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+  rule_revision         INTEGER NOT NULL,
+  alert_active          INTEGER NOT NULL DEFAULT 0,
+  active_since          INTEGER,
+  last_evaluated_at     INTEGER NOT NULL DEFAULT 0,
+  last_sample_at        INTEGER NOT NULL DEFAULT 0,
+  latest_value          REAL NOT NULL DEFAULT 0,
+  matched_samples       INTEGER NOT NULL DEFAULT 0,
+  total_samples         INTEGER NOT NULL DEFAULT 0,
+  last_notified_at      INTEGER,
+  recovery_pending      INTEGER NOT NULL DEFAULT 0,
+  silenced_until        INTEGER,
+  silenced_forever      INTEGER NOT NULL DEFAULT 0,
+  notification_claimed_at INTEGER,
+  notification_token INTEGER NOT NULL DEFAULT 0,
+  episode INTEGER NOT NULL DEFAULT 0,
+  delivered_telegram_episode INTEGER NOT NULL DEFAULT 0,
+  delivered_webhook_episode INTEGER NOT NULL DEFAULT 0,
+  updated_at            INTEGER NOT NULL,
+  PRIMARY KEY (rule_id, node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_load_rule_node_node ON load_rule_node(node_id);
+CREATE INDEX IF NOT EXISTS idx_load_alert_active ON load_alert_state(alert_active, last_evaluated_at);
+
 CREATE TABLE IF NOT EXISTS traffic (
   node_id  INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
   boot_id  TEXT    NOT NULL DEFAULT '',
@@ -236,7 +285,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -413,6 +462,62 @@ fn migrate_to_13(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "ip_other TEXT NOT NULL DEFAULT ''")
 }
 
+fn migrate_to_14(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"-- Resource alert rules are separate from connection lifecycle notifications.
+CREATE TABLE IF NOT EXISTS load_rule (
+  id               INTEGER PRIMARY KEY,
+  name             TEXT NOT NULL,
+  metric           TEXT NOT NULL,
+  threshold        REAL NOT NULL,
+  ratio            REAL NOT NULL,
+  interval_minutes INTEGER NOT NULL,
+  enabled          INTEGER NOT NULL DEFAULT 1,
+  default_enabled  INTEGER NOT NULL DEFAULT 0,
+  revision         INTEGER NOT NULL DEFAULT 1,
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS load_rule_node (
+  rule_id INTEGER NOT NULL REFERENCES load_rule(id) ON DELETE CASCADE,
+  node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (rule_id, node_id)
+);
+
+CREATE TABLE IF NOT EXISTS load_alert_state (
+  rule_id               INTEGER NOT NULL REFERENCES load_rule(id) ON DELETE CASCADE,
+  node_id               INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+  rule_revision         INTEGER NOT NULL,
+  alert_active          INTEGER NOT NULL DEFAULT 0,
+  active_since          INTEGER,
+  last_evaluated_at     INTEGER NOT NULL DEFAULT 0,
+  last_sample_at        INTEGER NOT NULL DEFAULT 0,
+  latest_value          REAL NOT NULL DEFAULT 0,
+  matched_samples       INTEGER NOT NULL DEFAULT 0,
+  total_samples         INTEGER NOT NULL DEFAULT 0,
+  last_notified_at      INTEGER,
+  recovery_pending      INTEGER NOT NULL DEFAULT 0,
+  silenced_until        INTEGER,
+  silenced_forever      INTEGER NOT NULL DEFAULT 0,
+  notification_claimed_at INTEGER,
+  notification_token INTEGER NOT NULL DEFAULT 0,
+  episode INTEGER NOT NULL DEFAULT 0,
+  delivered_telegram_episode INTEGER NOT NULL DEFAULT 0,
+  delivered_webhook_episode INTEGER NOT NULL DEFAULT 0,
+  updated_at            INTEGER NOT NULL,
+  PRIMARY KEY (rule_id, node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_load_rule_node_node ON load_rule_node(node_id);
+CREATE INDEX IF NOT EXISTS idx_load_alert_active ON load_alert_state(alert_active, last_evaluated_at);
+
+"#,
+    )?;
+    Ok(())
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -465,13 +570,19 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 13 {
         migrate_to_13(&tx)?;
     }
+    if from < 14 {
+        migrate_to_14(&tx)?;
+    }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
     Ok(())
 }
 
 /// Every table this build keeps.
-const TABLES: [&str; 10] = [
+const TABLES: [&str; 13] = [
+    "load_rule",
+    "load_rule_node",
+    "load_alert_state",
     "setting",
     "node",
     "traffic",
@@ -486,7 +597,8 @@ const TABLES: [&str; 10] = [
 
 /// The tables `migrate_to_11` adds. A backup taken before it lacks them and is
 /// still a backup this build restores.
-const HOURLY_TABLES: [&str; 2] = ["metric_hour", "ping_hour"];
+const MIGRATED_TABLES: [&str; 5] =
+    ["metric_hour", "ping_hour", "load_rule", "load_rule_node", "load_alert_state"];
 
 /// One node's stored configuration and last known facts.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -665,6 +777,118 @@ impl Traffic {
             _ => self.month_rx.saturating_add(self.month_tx),
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LoadRule {
+    #[serde(default)]
+    pub id: i64,
+    pub name: String,
+    pub metric: String,
+    pub threshold: f64,
+    pub ratio: f64,
+    pub interval_minutes: i64,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub default_enabled: bool,
+    #[serde(default = "one_i64")]
+    pub revision: i64,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+    #[serde(default)]
+    pub nodes: Vec<LoadRuleNode>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LoadRuleNode {
+    pub node_id: i64,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct CurrentLoadAlert {
+    pub stale: bool,
+    #[serde(skip)]
+    pub last_sample_at: i64,
+    pub rule_id: i64,
+    pub rule_name: String,
+    pub node_id: i64,
+    pub node_name: String,
+    pub metric: String,
+    pub threshold: f64,
+    pub ratio: f64,
+    pub interval_minutes: i64,
+    pub active_since: Option<i64>,
+    pub last_evaluated_at: i64,
+    pub latest_value: f64,
+    pub matched_samples: i64,
+    pub total_samples: i64,
+    pub last_notified_at: Option<i64>,
+    pub silenced: bool,
+    pub silenced_until: Option<i64>,
+    pub silenced_forever: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadMetricSample {
+    pub ts: i64,
+    pub cpu: f64,
+    pub mem_used: i64,
+    pub disk_used: i64,
+    pub net_rx: i64,
+    pub net_tx: i64,
+}
+
+pub struct LoadEvaluation {
+    pub rule_id: i64,
+    pub node_id: i64,
+    pub revision: i64,
+    pub active: bool,
+    pub latest_value: Option<f64>,
+    pub matched_samples: i64,
+    pub total_samples: i64,
+    pub now: i64,
+}
+
+pub struct LoadNoteKey {
+    pub rule_id: i64,
+    pub node_id: i64,
+    pub revision: i64,
+    pub token: i64,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadNotificationKind {
+    Alert,
+    Recovery,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadNotificationAction {
+    pub rule_id: i64,
+    pub node_id: i64,
+    pub rule_name: String,
+    pub node_name: String,
+    pub metric: String,
+    pub threshold: f64,
+    pub ratio: f64,
+    pub interval_minutes: i64,
+    pub latest_value: f64,
+    pub matched_samples: i64,
+    pub total_samples: i64,
+    pub kind: LoadNotificationKind,
+    pub revision: i64,
+    pub token: i64,
+    pub episode: i64,
+}
+
+fn one_i64() -> i64 {
+    1
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -1183,6 +1407,7 @@ impl Db {
             tx.execute("UPDATE node SET name = ?1 WHERE id = ?2", params![format!("节点 {id}"), id])?;
         }
         tx.execute("INSERT INTO traffic (node_id) VALUES (?1)", [id])?;
+        tx.execute("INSERT INTO load_rule_node (rule_id, node_id, enabled) SELECT id, ?1, 1 FROM load_rule WHERE default_enabled=1", [id])?;
         tx.execute(
             "INSERT INTO ping_node (task_id, node_id) SELECT id, ?1 FROM ping_task WHERE auto_join",
             [id],
@@ -2047,6 +2272,529 @@ impl Db {
         Ok(pruned)
     }
 
+    // ---- load notification rules and alert state ----
+
+    pub fn load_rules(&self) -> Result<Vec<LoadRule>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, metric, threshold, ratio, interval_minutes,
+                    enabled, default_enabled, revision, created_at, updated_at
+             FROM load_rule ORDER BY id",
+        )?;
+        let mut rules: Vec<LoadRule> = stmt
+            .query_map([], |row| {
+                Ok(LoadRule {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    metric: row.get(2)?,
+                    threshold: row.get(3)?,
+                    ratio: row.get(4)?,
+                    interval_minutes: row.get(5)?,
+                    enabled: row.get(6)?,
+                    default_enabled: row.get(7)?,
+                    revision: row.get(8)?,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
+                    nodes: Vec::new(),
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        drop(stmt);
+        let mut target_stmt =
+            conn.prepare("SELECT node_id, enabled FROM load_rule_node WHERE rule_id=?1 ORDER BY node_id")?;
+        for rule in &mut rules {
+            rule.nodes = target_stmt
+                .query_map([rule.id], |row| Ok(LoadRuleNode { node_id: row.get(0)?, enabled: row.get(1)? }))?
+                .collect::<Result<_, _>>()?;
+        }
+        Ok(rules)
+    }
+
+    pub fn create_load_rule(&self, rule: &LoadRule) -> Result<i64> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let now = Utc::now().timestamp();
+        let id = next_id(&tx, "load_rule")?;
+        tx.execute(
+            "INSERT INTO load_rule
+             (id, name, metric, threshold, ratio, interval_minutes, enabled, default_enabled,
+              revision, created_at, updated_at)
+             VALUES (?9,?1,?2,?3,?4,?5,?6,?7,1,?8,?8)",
+            params![
+                rule.name,
+                rule.metric,
+                rule.threshold,
+                rule.ratio,
+                rule.interval_minutes,
+                rule.enabled,
+                rule.default_enabled,
+                now,
+                id
+            ],
+        )?;
+        for target in &rule.nodes {
+            let changed = tx.execute(
+                "INSERT INTO load_rule_node (rule_id, node_id, enabled)
+                 SELECT ?1, id, ?3 FROM node WHERE id=?2",
+                params![id, target.node_id, target.enabled],
+            )?;
+            if changed != 1 {
+                refuse!("节点 {} 不存在", target.node_id);
+            }
+        }
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn update_load_rule(&self, id: i64, rule: &LoadRule) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let existing: (String, f64, f64, i64, i64, bool, bool) = tx
+            .query_row(
+                "SELECT metric, threshold, ratio, interval_minutes, revision, enabled, default_enabled
+                 FROM load_rule WHERE id=?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::Error::msg(crate::Shown("负载规则不存在".into())))?;
+        for target in &rule.nodes {
+            let exists: i64 =
+                tx.query_row("SELECT EXISTS(SELECT 1 FROM node WHERE id=?1)", [target.node_id], |row| {
+                    row.get(0)
+                })?;
+            if exists == 0 {
+                refuse!("节点 {} 不存在", target.node_id);
+            }
+        }
+        let semantic_changed = existing.0 != rule.metric
+            || existing.1 != rule.threshold
+            || existing.2 != rule.ratio
+            || existing.3 != rule.interval_minutes;
+        let revision = if semantic_changed { existing.4.saturating_add(1).max(1) } else { existing.4.max(1) };
+        let now = Utc::now().timestamp();
+        tx.execute(
+            "UPDATE load_rule SET name=?2, metric=?3, threshold=?4, ratio=?5,
+                    interval_minutes=?6, enabled=?7, default_enabled=?8,
+                    revision=?9, updated_at=?10 WHERE id=?1",
+            params![
+                id,
+                rule.name,
+                rule.metric,
+                rule.threshold,
+                rule.ratio,
+                rule.interval_minutes,
+                rule.enabled,
+                rule.default_enabled,
+                revision,
+                now
+            ],
+        )?;
+
+        let old_targets: HashSet<i64> = {
+            let mut stmt = tx.prepare("SELECT node_id FROM load_rule_node WHERE rule_id=?1")?;
+            let targets = stmt.query_map([id], |row| row.get(0))?.collect::<Result<_, _>>()?;
+            targets
+        };
+        let new_targets: HashSet<i64> = rule.nodes.iter().map(|target| target.node_id).collect();
+        for target in &rule.nodes {
+            tx.execute(
+                "INSERT INTO load_rule_node (rule_id, node_id, enabled) VALUES (?1,?2,?3)
+                 ON CONFLICT(rule_id,node_id) DO UPDATE SET enabled=excluded.enabled",
+                params![id, target.node_id, target.enabled],
+            )?;
+        }
+        for node_id in old_targets.difference(&new_targets) {
+            tx.execute("DELETE FROM load_rule_node WHERE rule_id=?1 AND node_id=?2", params![id, node_id])?;
+            tx.execute("DELETE FROM load_alert_state WHERE rule_id=?1 AND node_id=?2", params![id, node_id])?;
+        }
+        if semantic_changed || (existing.5 && !rule.enabled) {
+            tx.execute("DELETE FROM load_alert_state WHERE rule_id=?1", [id])?;
+        } else {
+            for target in rule.nodes.iter().filter(|target| !target.enabled) {
+                tx.execute(
+                    "DELETE FROM load_alert_state WHERE rule_id=?1 AND node_id=?2",
+                    params![id, target.node_id],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_load_rule(&self, id: i64) -> Result<()> {
+        let changed = self.conn().execute("DELETE FROM load_rule WHERE id=?1", [id])?;
+        if changed == 0 {
+            refuse!("负载规则不存在");
+        }
+        Ok(())
+    }
+
+    pub fn load_alert_due(&self, rule_id: i64, node_id: i64, now: i64) -> Result<bool> {
+        let row: Option<(i64, i64)> = self
+            .conn()
+            .query_row(
+                "SELECT COALESCE(s.last_evaluated_at,0), r.interval_minutes FROM load_rule r
+             JOIN load_rule_node n ON n.rule_id=r.id AND n.node_id=?2 AND n.enabled=1
+             LEFT JOIN load_alert_state s ON s.rule_id=r.id AND s.node_id=n.node_id
+             WHERE r.id=?1 AND r.enabled=1",
+                params![rule_id, node_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.is_some_and(|(last, interval)| {
+            last == 0 || now.saturating_sub(last) >= interval.saturating_mul(60)
+        }))
+    }
+
+    pub fn last_load_sample(&self, rule_id: i64, node_id: i64) -> Result<i64> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT last_sample_at FROM load_alert_state WHERE rule_id=?1 AND node_id=?2",
+                params![rule_id, node_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    pub fn set_last_load_sample(
+        &self,
+        rule_id: i64,
+        node_id: i64,
+        revision: i64,
+        sample_at: i64,
+    ) -> Result<()> {
+        self.conn().execute("UPDATE load_alert_state SET last_sample_at=?4 WHERE rule_id=?1 AND node_id=?2 AND rule_revision=?3", params![rule_id,node_id,revision,sample_at])?;
+        Ok(())
+    }
+
+    /// Recheck queued load events against the current rule, state and silence.
+    pub fn load_note_allowed(&self, key: &LoadNoteKey, channel: &str, now: i64) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM load_rule r JOIN load_rule_node n ON n.rule_id=r.id
+             JOIN load_alert_state s ON s.rule_id=r.id AND s.node_id=n.node_id
+             WHERE r.id=?1 AND n.node_id=?2 AND r.enabled=1 AND n.enabled=1
+             AND r.revision=?3 AND s.rule_revision=?3 AND s.alert_active=?4 AND s.notification_token=?6
+             AND s.silenced_forever=0 AND (s.silenced_until IS NULL OR s.silenced_until<=?5)
+             AND (?4 OR (s.episode>0 AND CASE ?7 WHEN 'Telegram' THEN s.delivered_telegram_episode WHEN 'Webhook' THEN s.delivered_webhook_episode ELSE 0 END = s.episode)))",
+            params![key.rule_id, key.node_id, key.revision, key.active, now, key.token, channel],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn mark_load_delivered(
+        &self,
+        rule_id: i64,
+        node_id: i64,
+        revision: i64,
+        episode: i64,
+        channel: &str,
+    ) -> Result<()> {
+        let sql = match channel {
+            "Telegram" => "UPDATE load_alert_state SET delivered_telegram_episode=?4 WHERE rule_id=?1 AND node_id=?2 AND rule_revision=?3 AND episode=?4",
+            "Webhook" => "UPDATE load_alert_state SET delivered_webhook_episode=?4 WHERE rule_id=?1 AND node_id=?2 AND rule_revision=?3 AND episode=?4",
+            _ => return Ok(()),
+        };
+        self.conn().execute(sql, params![rule_id, node_id, revision, episode])?;
+        Ok(())
+    }
+
+    pub fn load_metric_samples(&self, node_id: i64, since: i64, until: i64) -> Result<Vec<LoadMetricSample>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT ts, cpu, mem_used, disk_used, net_rx, net_tx
+             FROM metric WHERE node_id=?1 AND ts>=?2 AND ts<=?3 ORDER BY ts",
+        )?;
+        let rows = stmt.query_map(params![node_id, since, until], |row| {
+            Ok(LoadMetricSample {
+                ts: row.get(0)?,
+                cpu: row.get(1)?,
+                mem_used: row.get(2)?,
+                disk_used: row.get(3)?,
+                net_rx: row.get(4)?,
+                net_tx: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn apply_load_evaluation(
+        &self,
+        evaluation: LoadEvaluation,
+    ) -> Result<Option<LoadNotificationAction>> {
+        let LoadEvaluation {
+            rule_id,
+            node_id,
+            revision,
+            active,
+            latest_value,
+            matched_samples,
+            total_samples,
+            now,
+        } = evaluation;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let rule: Option<(String, String, f64, f64, i64, i64)> = tx
+            .query_row(
+                "SELECT r.name, r.metric, r.threshold, r.ratio, r.interval_minutes, r.revision
+             FROM load_rule r JOIN load_rule_node n ON n.rule_id=r.id AND n.node_id=?2 AND n.enabled=1
+             WHERE r.id=?1 AND r.enabled=1",
+                params![rule_id, node_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .optional()?;
+        let Some((rule_name, metric, threshold, ratio, interval, stored_revision)) = rule else {
+            return Ok(None);
+        };
+        if stored_revision != revision {
+            return Ok(None);
+        }
+        type Previous = (bool, Option<i64>, Option<i64>, bool, Option<i64>, bool, Option<i64>, i64, i64);
+        let previous: Option<Previous> = tx
+            .query_row(
+                "SELECT alert_active, active_since, last_notified_at, recovery_pending,
+                    silenced_until, silenced_forever, notification_claimed_at, episode, notification_token
+             FROM load_alert_state WHERE rule_id=?1 AND node_id=?2",
+                params![rule_id, node_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let was_active = previous.as_ref().is_some_and(|p| p.0);
+        let mut last_notified = previous.as_ref().and_then(|p| p.2);
+        let mut recovery_pending = previous.as_ref().is_some_and(|p| p.3);
+        let silence_until = previous.as_ref().and_then(|p| p.4);
+        let silence_forever = previous.as_ref().is_some_and(|p| p.5);
+        let silenced = silence_forever || silence_until.is_some_and(|t| t > now);
+        let mut claimed = previous
+            .as_ref()
+            .and_then(|p| p.6)
+            .filter(|t| now.saturating_sub(*t) < interval.saturating_mul(120).max(300));
+        if active != was_active {
+            claimed = None;
+        }
+        let active_since = if active {
+            previous.as_ref().and_then(|p| p.1).filter(|_| was_active).or(Some(now))
+        } else {
+            None
+        };
+        if active {
+            recovery_pending = false;
+        } else if was_active && last_notified.is_some() && !silenced {
+            recovery_pending = true;
+        } else if silenced || !recovery_pending {
+            recovery_pending = false;
+            last_notified = None;
+        }
+        let kind = if !silenced && claimed.is_none() {
+            if active && last_notified.is_none_or(|t| now.saturating_sub(t) >= interval.saturating_mul(60)) {
+                Some(LoadNotificationKind::Alert)
+            } else if !active && recovery_pending {
+                Some(LoadNotificationKind::Recovery)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if kind.is_some() {
+            claimed = Some(now);
+        }
+        let sequence = || -> Result<i64> {
+            let next = setting(&tx, "load_notification_seq")?
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0)
+                .saturating_add(1);
+            put_setting(&tx, "load_notification_seq", &next.to_string())?;
+            Ok(next)
+        };
+        let episode = if active && !was_active { sequence()? } else { previous.as_ref().map_or(0, |p| p.7) };
+        let old_token = previous.as_ref().map_or(0, |p| p.8);
+        let token =
+            if kind.is_some() && (old_token == 0 || active != was_active) { sequence()? } else { old_token };
+        let latest_value = latest_value.unwrap_or(0.0);
+        tx.execute(
+            "INSERT INTO load_alert_state
+             (rule_id,node_id,rule_revision,alert_active,active_since,last_evaluated_at,latest_value,matched_samples,total_samples,
+              last_notified_at,recovery_pending,silenced_until,silenced_forever,notification_claimed_at,episode,notification_token,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?6)
+             ON CONFLICT(rule_id,node_id) DO UPDATE SET rule_revision=excluded.rule_revision, alert_active=excluded.alert_active,
+             active_since=excluded.active_since,last_evaluated_at=excluded.last_evaluated_at,latest_value=excluded.latest_value,
+             matched_samples=excluded.matched_samples,total_samples=excluded.total_samples,last_notified_at=excluded.last_notified_at,
+             recovery_pending=excluded.recovery_pending,silenced_until=excluded.silenced_until,silenced_forever=excluded.silenced_forever,
+             notification_claimed_at=excluded.notification_claimed_at,episode=excluded.episode,notification_token=excluded.notification_token,updated_at=excluded.updated_at",
+            params![rule_id,node_id,revision,active,active_since,now,latest_value,matched_samples,total_samples,last_notified,recovery_pending,
+                silence_until,silence_forever,claimed,episode,token],
+        )?;
+        tx.commit()?;
+        Ok(kind.map(|kind| LoadNotificationAction {
+            rule_id,
+            node_id,
+            rule_name,
+            node_name: String::new(),
+            metric,
+            threshold,
+            ratio,
+            interval_minutes: interval,
+            latest_value,
+            matched_samples,
+            total_samples,
+            kind,
+            revision,
+            token,
+            episode,
+        }))
+    }
+
+    /// A full notification queue leaves the claim available for another pass.
+    pub fn retry_load_enqueue(&self, rule_id: i64, node_id: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE load_alert_state SET notification_claimed_at=NULL, last_evaluated_at=0, last_sample_at=0
+             WHERE rule_id=?1 AND node_id=?2 AND notification_claimed_at IS NOT NULL",
+            params![rule_id, node_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_load_notification(
+        &self,
+        rule_id: i64,
+        node_id: i64,
+        kind: LoadNotificationKind,
+        now: i64,
+    ) -> Result<()> {
+        match kind {
+            LoadNotificationKind::Alert => {
+                self.conn().execute(
+                    "UPDATE load_alert_state SET
+                     last_notified_at=CASE WHEN alert_active=1 THEN ?3 ELSE last_notified_at END,
+                     recovery_pending=CASE WHEN alert_active=1 THEN 0 ELSE recovery_pending END,
+                     notification_claimed_at=NULL, updated_at=?3
+                     WHERE rule_id=?1 AND node_id=?2
+                           AND notification_claimed_at IS NOT NULL",
+                    params![rule_id, node_id, now],
+                )?;
+            }
+            LoadNotificationKind::Recovery => {
+                self.conn().execute(
+                    "UPDATE load_alert_state SET
+                     last_notified_at=CASE
+                       WHEN alert_active=0 AND recovery_pending=1 THEN NULL
+                       ELSE last_notified_at
+                     END,
+                     recovery_pending=CASE
+                       WHEN alert_active=0 AND recovery_pending=1 THEN 0
+                       ELSE recovery_pending
+                     END,
+                     notification_claimed_at=NULL, updated_at=?3
+                     WHERE rule_id=?1 AND node_id=?2
+                           AND notification_claimed_at IS NOT NULL",
+                    params![rule_id, node_id, now],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_load_alert_silence(
+        &self,
+        rule_id: i64,
+        node_id: i64,
+        silenced_until: Option<i64>,
+        silenced_forever: bool,
+        now: i64,
+    ) -> Result<()> {
+        let changed = self.conn().execute(
+            "UPDATE load_alert_state
+             SET silenced_until=?3, silenced_forever=?4, notification_token=0,
+                 notification_claimed_at=NULL, updated_at=?5
+             WHERE rule_id=?1 AND node_id=?2 AND alert_active=1",
+            params![rule_id, node_id, silenced_until, silenced_forever, now],
+        )?;
+        if changed == 0 {
+            refuse!("当前负载告警不存在");
+        }
+        Ok(())
+    }
+
+    pub fn current_load_alerts(&self, now: i64) -> Result<Vec<CurrentLoadAlert>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.name, n.id, n.name, r.metric, r.threshold, r.ratio,
+                    r.interval_minutes, s.active_since, s.last_evaluated_at,
+                    s.latest_value, s.matched_samples, s.total_samples,
+                    s.last_notified_at, s.silenced_until, s.silenced_forever,
+                    COALESCE((SELECT MAX(ts) FROM metric m WHERE m.node_id=n.id),0)
+             FROM load_alert_state s
+             JOIN load_rule r ON r.id=s.rule_id AND r.enabled=1
+             JOIN load_rule_node t ON t.rule_id=s.rule_id AND t.node_id=s.node_id AND t.enabled=1
+             JOIN node n ON n.id=s.node_id
+             WHERE s.alert_active=1
+             ORDER BY s.active_since DESC, r.id, n.id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                CurrentLoadAlert {
+                    stale: false,
+                    last_sample_at: row.get(16)?,
+                    rule_id: row.get(0)?,
+                    rule_name: row.get(1)?,
+                    node_id: row.get(2)?,
+                    node_name: row.get(3)?,
+                    metric: row.get(4)?,
+                    threshold: row.get(5)?,
+                    ratio: row.get(6)?,
+                    interval_minutes: row.get(7)?,
+                    active_since: row.get(8)?,
+                    last_evaluated_at: row.get(9)?,
+                    latest_value: row.get(10)?,
+                    matched_samples: row.get(11)?,
+                    total_samples: row.get(12)?,
+                    last_notified_at: row.get(13)?,
+                    silenced: false,
+                    silenced_until: row.get(14)?,
+                    silenced_forever: row.get(15)?,
+                },
+                row.get::<_, i64>(7)?,
+            ))
+        })?;
+        let mut alerts = Vec::new();
+        for row in rows {
+            let (mut alert, interval) = row?;
+            let _ = interval;
+            alert.stale = alert.last_sample_at.saturating_add(120) <= now;
+            alert.silenced = alert.silenced_forever || alert.silenced_until.is_some_and(|until| until > now);
+            if !alert.silenced {
+                alert.silenced_until = None;
+            }
+            alerts.push(alert);
+        }
+        Ok(alerts)
+    }
+
     // ---- ping ----
 
     pub fn ping_tasks(&self) -> Result<Vec<PingTask>> {
@@ -2599,7 +3347,7 @@ impl Db {
         }
         // The hourly tables are created by the migration below; their columns are
         // compared with the rest once it has run.
-        for table in TABLES.iter().filter(|t| !HOURLY_TABLES.contains(t)) {
+        for table in TABLES.iter().filter(|t| !MIGRATED_TABLES.contains(t)) {
             let found: i64 = candidate.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
                 [table],
@@ -2810,7 +3558,7 @@ fn issued(conn: &Connection, table: &str) -> Result<i64> {
 }
 
 /// The tables whose ids [`next_id`] issues.
-pub(crate) const ID_TABLES: [&str; 2] = ["node", "ping_task"];
+pub(crate) const ID_TABLES: [&str; 3] = ["node", "ping_task", "load_rule"];
 
 fn setting(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(conn.query_row("SELECT value FROM setting WHERE key = ?1", [key], |r| r.get(0)).optional()?)
@@ -4383,7 +5131,7 @@ mod tests {
         // One row per table, plus the id high marks `open` records.
         assert_eq!(
             upgraded.len(),
-            TABLES.len() - HOURLY_TABLES.len() + ID_TABLES.len(),
+            TABLES.len() - MIGRATED_TABLES.len() + ID_TABLES.len(),
             "every row survives: {upgraded:#?}"
         );
 

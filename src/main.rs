@@ -29,6 +29,7 @@ mod api;
 mod auth;
 mod db;
 mod frontend;
+mod load_notification;
 mod notify;
 
 use std::collections::HashMap;
@@ -93,6 +94,7 @@ pub struct App {
     /// request; see `api::versions`.
     pub releases: Mutex<Releases>,
     pub fx: Mutex<Option<FxSnapshot>>,
+    pub load_notifications: load_notification::LoadNotificationManager,
 }
 
 #[derive(Default, Clone)]
@@ -122,6 +124,7 @@ impl App {
             notes,
             releases: Mutex::default(),
             fx: Mutex::default(),
+            load_notifications: load_notification::LoadNotificationManager::default(),
         }
     }
 
@@ -631,6 +634,7 @@ async fn main() -> Result<()> {
     tokio::spawn(housekeeping(app.clone()));
     tokio::spawn(notify::deliver(app.clone(), inbox));
     tokio::spawn(notify::watch(app.clone()));
+    app.load_notifications.start(app.clone());
 
     let listener = match tokio::net::TcpListener::bind(args.listen).await {
         Ok(listener) => listener,
@@ -687,6 +691,19 @@ fn router(app: Shared) -> Router {
         .route("/api/cost/fx/refresh", post(api::refresh_fx))
         .route("/api/version", get(api::versions))
         .route("/api/notify/test", post(notify::test))
+        .route(
+            "/api/notification/load/rules",
+            get(api::load_notification_rules).post(api::create_load_notification_rule),
+        )
+        .route(
+            "/api/notification/load/rules/{id}",
+            put(api::update_load_notification_rule).delete(api::delete_load_notification_rule),
+        )
+        .route("/api/notification/load/current", get(api::current_load_alerts))
+        .route(
+            "/api/notification/load/current/{rule_id}/{node_id}/silence",
+            post(api::set_load_alert_silence),
+        )
         .route("/api/themes", get(api::themes))
         .route("/api/themes/{short}", delete(api::delete_theme))
         .route("/api/themes/{short}/preview", get(api::theme_preview))
@@ -1175,6 +1192,20 @@ mod tests {
         assert_eq!(send("POST", "/api/auth/login", form, "same-site").await, refused);
         assert_eq!(send("GET", "/api/cost/fx", 0, "same-origin").await.0, StatusCode::UNAUTHORIZED);
         assert_eq!(send("POST", "/api/cost/fx/refresh", 0, "same-origin").await.0, StatusCode::UNAUTHORIZED);
+        for (method, path) in [
+            ("GET", "/api/notification/load/rules"),
+            ("POST", "/api/notification/load/rules"),
+            ("PUT", "/api/notification/load/rules/1"),
+            ("DELETE", "/api/notification/load/rules/1"),
+            ("GET", "/api/notification/load/current"),
+            ("POST", "/api/notification/load/current/1/1/silence"),
+        ] {
+            assert_eq!(
+                send(method, path, 0, "same-origin").await.0,
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+        }
         assert_eq!(
             send("GET", "/api/nope", 0, "same-origin").await,
             (StatusCode::NOT_FOUND, "没有这个接口：/api/nope".into())
@@ -1206,6 +1237,63 @@ mod tests {
         script.headers_mut().insert(header::ACCEPT_ENCODING, header::HeaderValue::from_static("gzip"));
         let script = routes.clone().oneshot(script).await.unwrap();
         assert_eq!(script.headers().get(header::CONTENT_ENCODING).map(|v| v.as_bytes()), Some(&b"gzip"[..]));
+    }
+
+    #[tokio::test]
+    async fn signed_in_load_rules_can_be_managed_and_alerts_silenced() {
+        use serde_json::{json, Value};
+        use tower::ServiceExt;
+
+        async fn request(routes: &Router, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
+            let request = axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, "monitor_session=load-test")
+                .header("sec-fetch-site", "same-origin")
+                .extension(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))))
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap();
+            let response = routes.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        }
+
+        let app = Arc::new(App::for_test(Db::open(":memory:").unwrap()));
+        app.db.create_session(&auth::sha256("load-test"), Utc::now().timestamp() + 3_600).unwrap();
+        let node = app
+            .db
+            .create_node(&db::Node { name: "Test node".into(), ..Default::default() }, "load-node")
+            .unwrap();
+        let routes = router(app.clone());
+        let rule = json!({"name":"CPU", "metric":"cpu", "threshold":80, "ratio":0.5,
+            "interval_minutes":1, "enabled":true, "default_enabled":false,
+            "nodes":[{"node_id":node,"enabled":true}]});
+        let (status, created) = request(&routes, "POST", "/api/notification/load/rules", rule.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        let id = created["id"].as_i64().unwrap();
+        let path = format!("/api/notification/load/rules/{id}");
+        let mut edited = rule;
+        edited["name"] = json!("Edited");
+        edited["threshold"] = json!(85);
+        assert_eq!(request(&routes, "PUT", &path, edited).await.0, StatusCode::OK);
+        let (status, listed) = request(&routes, "GET", "/api/notification/load/rules", Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed["rules"][0]["name"], "Edited");
+        let now = Utc::now().timestamp();
+        app.db.insert_metric(node, now.div_euclid(60) * 60, &json!({"cpu":90})).unwrap();
+        assert_eq!(crate::load_notification::evaluate_due(&app.db, now).unwrap().len(), 1);
+        let (status, alerts) = request(&routes, "GET", "/api/notification/load/current", Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(alerts["alerts"][0]["silenced"], false);
+        let silence = format!("/api/notification/load/current/{id}/{node}/silence");
+        assert_eq!(request(&routes, "POST", &silence, json!({"mode":"24h"})).await.0, StatusCode::OK);
+        let (_, alerts) = request(&routes, "GET", "/api/notification/load/current", Value::Null).await;
+        assert_eq!(alerts["alerts"][0]["silenced"], true);
+        assert_eq!(request(&routes, "DELETE", &path, Value::Null).await.0, StatusCode::OK);
+        let (_, listed) = request(&routes, "GET", "/api/notification/load/rules", Value::Null).await;
+        assert_eq!(listed["rules"].as_array().unwrap().len(), 0);
     }
 
     fn app(site: &str) -> App {

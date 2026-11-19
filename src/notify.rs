@@ -36,6 +36,8 @@ pub struct Note {
     /// Unix seconds, stamped when queued: delivery can trail the event by minutes
     /// while a channel is retried.
     pub time: i64,
+    /// Load alerts are checked against current state before delivery.
+    pub load: Option<crate::load_notification::LoadNote>,
 }
 
 /// Alerts awaiting delivery. A channel that stays down holds each alert for
@@ -383,10 +385,19 @@ async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> 
 
 /// Queues an alert without waiting, so that sign-in and housekeeping never
 /// stall behind a slow channel.
-pub fn send(app: &App, mut note: Note) {
+pub fn send(app: &App, note: Note) {
+    let _ = try_send(app, note);
+}
+
+/// Reports a full or closed queue so resource alerts can retry their claim.
+pub fn try_send(app: &App, mut note: Note) -> bool {
     note.time = Utc::now().timestamp();
-    if let Err(mpsc::error::TrySendError::Full(note)) = app.notes.try_send(note) {
-        warn!("notification queue is full; dropped {:?}", note.title);
+    match app.notes.try_send(note) {
+        Ok(()) => true,
+        Err(error) => {
+            warn!("notification queue unavailable: {error}");
+            false
+        }
     }
 }
 
@@ -399,8 +410,16 @@ pub async fn deliver(app: Shared, mut inbox: mpsc::Receiver<Note>) {
     while let Some(note) = inbox.recv().await {
         for channel in channels(&app) {
             for attempt in 1..=ATTEMPTS {
+                if note.load.as_ref().is_some_and(|load| !load.allowed(&app, channel.name())) {
+                    break;
+                }
                 match post(&app, &channel, &note).await {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        if let Some(load) = &note.load {
+                            load.delivered(&app, channel.name());
+                        }
+                        break;
+                    }
                     Err(f) if !f.retry || attempt == ATTEMPTS => {
                         warn!("{} alert {:?} not delivered: {}", channel.name(), note.title, f.reason);
                         break;

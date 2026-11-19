@@ -1,6 +1,6 @@
 //! The panel and public-status HTTP surface.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use axum::extract::rejection::JsonRejection;
@@ -20,7 +20,7 @@ use crate::agent_ws::Agent;
 use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
 };
-use crate::db::{self, Db, Node, NodePatch, PingTask, Traffic, TrafficPatch};
+use crate::db::{self, Db, LoadRule, LoadRuleNode, Node, NodePatch, PingTask, Traffic, TrafficPatch};
 use crate::{agent_ws, App, FxSnapshot, Shared};
 
 // A fixed upstream prevents the refresh endpoint becoming a proxy for arbitrary URLs.
@@ -1590,6 +1590,206 @@ pub async fn delete_ping_task(_: Admin, State(app): State<Shared>, Path(id): Pat
     }
 }
 
+const MAX_LOAD_RULE_NAME_CHARS: usize = 128;
+const MAX_LOAD_RULE_TARGETS: usize = 10_000;
+
+fn default_load_rule_enabled() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+pub struct LoadRuleInput {
+    name: String,
+    metric: String,
+    threshold: f64,
+    ratio: f64,
+    interval_minutes: i64,
+    #[serde(default = "default_load_rule_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    default_enabled: bool,
+    #[serde(default)]
+    nodes: Vec<LoadRuleNode>,
+}
+
+#[derive(Deserialize)]
+pub struct LoadSilenceInput {
+    mode: String,
+}
+
+/// Validate before a rule reaches the database, keeping the window and the
+/// number of node associations bounded even for requests outside the panel.
+fn normalize_load_rule(input: LoadRuleInput) -> Result<LoadRule, String> {
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err("负载规则名称不能为空".into());
+    }
+    if name.chars().count() > MAX_LOAD_RULE_NAME_CHARS || name.chars().any(char::is_control) {
+        return Err(format!("负载规则名称不能超过 {MAX_LOAD_RULE_NAME_CHARS} 个字符且不能包含控制字符"));
+    }
+    let metric = input.metric.trim().to_ascii_lowercase();
+    if !matches!(metric.as_str(), "cpu" | "ram" | "disk" | "net_in" | "net_out") {
+        return Err("监控项必须是 cpu、ram、disk、net_in 或 net_out".into());
+    }
+    if !input.threshold.is_finite() || input.threshold < 0.0 {
+        return Err("阈值必须是非负有限数字".into());
+    }
+    if matches!(metric.as_str(), "cpu" | "ram" | "disk") && input.threshold > 100.0 {
+        return Err("CPU、RAM、Disk 阈值必须在 0 到 100 之间".into());
+    }
+    if !input.ratio.is_finite() || !(0.0 < input.ratio && input.ratio <= 1.0) {
+        return Err("时间占比必须大于 0 且不超过 1".into());
+    }
+    if !(1..=240).contains(&input.interval_minutes) {
+        return Err("间隔必须是 1 到 240 分钟之间的整数".into());
+    }
+    if input.nodes.len() > MAX_LOAD_RULE_TARGETS {
+        return Err(format!("关联服务器数量不能超过 {MAX_LOAD_RULE_TARGETS} 个"));
+    }
+    let mut seen = HashSet::with_capacity(input.nodes.len());
+    for target in &input.nodes {
+        if target.node_id <= 0 {
+            return Err("关联服务器 ID 必须是正数".into());
+        }
+        if !seen.insert(target.node_id) {
+            return Err(format!("服务器 {} 被重复关联", target.node_id));
+        }
+    }
+    Ok(LoadRule {
+        id: 0,
+        name: name.to_owned(),
+        metric,
+        threshold: input.threshold,
+        ratio: input.ratio,
+        interval_minutes: input.interval_minutes,
+        enabled: input.enabled,
+        default_enabled: input.default_enabled,
+        revision: 1,
+        created_at: 0,
+        updated_at: 0,
+        nodes: input.nodes,
+    })
+}
+
+pub async fn load_notification_rules(_: Admin, State(app): State<Shared>) -> Response {
+    match tokio::task::spawn_blocking(move || app.db.load_rules()).await {
+        Ok(Ok(rules)) => Json(json!({"rules": rules})).into_response(),
+        Ok(Err(e)) => fail(e),
+        Err(e) => fail(e),
+    }
+}
+
+pub async fn create_load_notification_rule(
+    _: Admin,
+    State(app): State<Shared>,
+    body: Result<Json<LoadRuleInput>, JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else { return bad("负载规则格式不对") };
+    let rule = match normalize_load_rule(body) {
+        Ok(rule) => rule,
+        Err(e) => return bad(&e),
+    };
+    match tokio::task::spawn_blocking(move || app.db.create_load_rule(&rule)).await {
+        Ok(Ok(id)) => Json(json!({"id": id})).into_response(),
+        Ok(Err(e)) => fail(e),
+        Err(e) => fail(e),
+    }
+}
+
+pub async fn update_load_notification_rule(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(id): Path<i64>,
+    body: Result<Json<LoadRuleInput>, JsonRejection>,
+) -> Response {
+    if id <= 0 {
+        return bad("负载规则 ID 无效");
+    }
+    let Ok(Json(body)) = body else { return bad("负载规则格式不对") };
+    let rule = match normalize_load_rule(body) {
+        Ok(rule) => rule,
+        Err(e) => return bad(&e),
+    };
+    match tokio::task::spawn_blocking(move || app.db.update_load_rule(id, &rule)).await {
+        Ok(Ok(())) => Json(json!({"ok": true})).into_response(),
+        Ok(Err(e)) => fail(e),
+        Err(e) => fail(e),
+    }
+}
+
+pub async fn delete_load_notification_rule(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(id): Path<i64>,
+) -> Response {
+    if id <= 0 {
+        return bad("负载规则 ID 无效");
+    }
+    match tokio::task::spawn_blocking(move || app.db.delete_load_rule(id)).await {
+        Ok(Ok(())) => Json(json!({"ok": true})).into_response(),
+        Ok(Err(e)) => fail(e),
+        Err(e) => fail(e),
+    }
+}
+
+/// A history row can lag a report by a minute; slow-reporting agents need
+/// proportionally longer before a still-connected node is called stale.
+fn load_alert_stale(last_sample: i64, now: i64, interval: Option<Option<u64>>) -> bool {
+    let Some(interval) = interval else { return true };
+    let seconds = i64::try_from(interval.unwrap_or_default()).unwrap_or(i64::MAX);
+    let tolerance = seconds.saturating_mul(2).saturating_add(60).max(120);
+    last_sample <= 0 || now.saturating_sub(last_sample) > tolerance
+}
+
+pub async fn current_load_alerts(_: Admin, State(app): State<Shared>) -> Response {
+    let now = Utc::now().timestamp();
+    let lookup = app.clone();
+    match tokio::task::spawn_blocking(move || lookup.db.current_load_alerts(now)).await {
+        Ok(Ok(mut alerts)) => {
+            let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
+            for alert in &mut alerts {
+                alert.stale = load_alert_stale(
+                    alert.last_sample_at,
+                    now,
+                    agents.get(&alert.node_id).map(|a| a.interval()),
+                );
+            }
+            Json(json!({"alerts": alerts})).into_response()
+        }
+        Ok(Err(e)) => fail(e),
+        Err(e) => fail(e),
+    }
+}
+
+pub async fn set_load_alert_silence(
+    _: Admin,
+    State(app): State<Shared>,
+    Path((rule_id, node_id)): Path<(i64, i64)>,
+    body: Result<Json<LoadSilenceInput>, JsonRejection>,
+) -> Response {
+    if rule_id <= 0 || node_id <= 0 {
+        return bad("负载规则或服务器 ID 无效");
+    }
+    let Ok(Json(body)) = body else { return bad("静默模式格式不对") };
+    let mode = body.mode.trim().to_ascii_lowercase();
+    let now = Utc::now().timestamp();
+    let (silenced_until, silenced_forever) = match mode.as_str() {
+        "off" => (None, false),
+        "24h" => (Some(now.saturating_add(86_400)), false),
+        "3d" => (Some(now.saturating_add(3 * 86_400)), false),
+        "7d" => (Some(now.saturating_add(7 * 86_400)), false),
+        "forever" => (None, true),
+        _ => return bad("静默模式必须是 off、24h、3d、7d 或 forever"),
+    };
+    match tokio::task::spawn_blocking(move || {
+        app.db.set_load_alert_silence(rule_id, node_id, silenced_until, silenced_forever, now)
+    }).await {
+        Ok(Ok(())) => Json(json!({"ok": true, "mode": mode, "silenced_until": silenced_until, "silenced_forever": silenced_forever})).into_response(),
+        Ok(Err(e)) => fail(e),
+        Err(e) => fail(e),
+    }
+}
+
 /// Settings the panel may read. Secrets are deliberately excluded: the client can
 /// set the GitHub secret but never read it back.
 const READABLE_SETTINGS: &[&str] = &[
@@ -1846,6 +2046,10 @@ pub async fn db_restore(
 async fn restore(app: &Shared, source: &str) -> Result<(), anyhow::Error> {
     let (app, source) = (app.clone(), source.to_owned());
     tokio::task::spawn_blocking(move || {
+        // Keep evaluation from writing a snapshot of the old database after restore.
+        let _load_guard = app.load_notifications.restore_guard();
+        // Pending deliveries refer to the database about to be replaced.
+        app.load_notifications.invalidate_all();
         let outcome = app.db.check_backup(&source).and_then(|()| app.db.restore_from(&source));
         // SQLite writes a -wal and a -shm beside any file it opens in WAL mode,
         // and a plain copy of a running hub's database is exactly that. They are
@@ -2513,6 +2717,44 @@ mod tests {
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
+    }
+
+    #[test]
+    fn load_rule_validation_rejects_invalid_conditions_and_targets() {
+        let base = json!({"name":" CPU ","metric":" CPU ","threshold":80.0,"ratio":0.5,
+            "interval_minutes":10,"nodes":[{"node_id":1,"enabled":true}]});
+        let parse = |value: Value| normalize_load_rule(serde_json::from_value(value).unwrap());
+        let rule = parse(base.clone()).unwrap();
+        assert_eq!((rule.name.as_str(), rule.metric.as_str()), ("CPU", "cpu"));
+        for (field, value) in [
+            ("name", json!(" ")),
+            ("metric", json!("unknown")),
+            ("threshold", json!(101)),
+            ("ratio", json!(0)),
+            ("ratio", json!(1.01)),
+            ("interval_minutes", json!(0)),
+            ("interval_minutes", json!(241)),
+            ("nodes", json!([{"node_id":1},{"node_id":1}])),
+            ("nodes", json!([{"node_id":0}])),
+        ] {
+            let mut invalid = base.clone();
+            invalid[field] = value;
+            assert!(parse(invalid).is_err(), "{field}");
+        }
+        let mut network = base;
+        network["metric"] = json!("net_in");
+        network["threshold"] = json!(1000);
+        assert!(parse(network).is_ok(), "network thresholds are Mbps, not percentages");
+    }
+
+    #[test]
+    fn load_staleness_accounts_for_disconnection_and_slow_reporting() {
+        assert!(load_alert_stale(1_000, 1_001, None), "disconnected");
+        assert!(load_alert_stale(0, 1_000, Some(None)), "no samples");
+        assert!(!load_alert_stale(1_000, 1_120, Some(None)));
+        assert!(load_alert_stale(1_000, 1_121, Some(None)));
+        assert!(!load_alert_stale(1_000, 1_660, Some(Some(300))));
+        assert!(load_alert_stale(1_000, 1_661, Some(Some(300))));
     }
 
     #[test]
