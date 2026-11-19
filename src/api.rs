@@ -2646,10 +2646,7 @@ mod tests {
     /// fetch.
     #[test]
     fn only_a_github_repository_url_can_name_a_release_to_download() {
-        assert_eq!(
-            github_repo("https://github.com/uyo8os/monitor"),
-            Some(("uyo8os", "monitor"))
-        );
+        assert_eq!(github_repo("https://github.com/uyo8os/monitor"), Some(("uyo8os", "monitor")));
         // A link to the repository, in whatever form the author wrote it or the
         // address bar showed it.
         assert_eq!(github_repo("https://github.com/a/b.git"), Some(("a", "b")));
