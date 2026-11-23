@@ -523,6 +523,60 @@ pub fn expiry_digest(app: &App, now: DateTime<Local>) -> Result<Option<Note>> {
     Ok(batch("expiry", "⏳", "即将到期", items))
 }
 
+pub fn has_channels(app: &App) -> bool {
+    !channels(app).is_empty()
+}
+
+/// Subscription reminders use the same channel setup and rendering as other
+/// notifications. Keep their delivery ledger per channel so a failed webhook
+/// can retry on the next hour without repeating a successful Telegram message.
+pub async fn watch_subscriptions(app: Shared) {
+    loop {
+        let now = Local::now();
+        if now.hour() >= 9 {
+            if let Err(error) = send_subscription_reminders(&app, now.date_naive()).await {
+                warn!("subscription reminders failed: {error:#}");
+            }
+        }
+        tokio::time::sleep(crate::until_next_hour(Local::now())).await;
+    }
+}
+
+async fn send_subscription_reminders(app: &App, today: NaiveDate) -> Result<()> {
+    for channel in channels(app) {
+        let pending = app.db.subscription_reminders(today, channel.name())?;
+        for entries in pending.chunks(5) {
+            let lines: Vec<_> = entries
+                .iter()
+                .map(|entry| {
+                    let name: String = entry.name.chars().take(60).collect();
+                    let status = match (entry.due - today).num_days() {
+                        0 => "今天到期".to_owned(),
+                        d if d > 0 => format!("{d} 天后到期"),
+                        d => format!("已逾期 {} 天", -d),
+                    };
+                    format!("{name} · {} · {status}", entry.due)
+                })
+                .collect();
+            let note = Note {
+                event: "subscription_due",
+                title: "订阅续费提醒".into(),
+                message: lines.join("\n"),
+                time: Utc::now().timestamp(),
+                ..Default::default()
+            };
+            match post(app, &channel, &note).await {
+                Ok(()) => app.db.mark_subscription_reminders(entries, channel.name())?,
+                Err(error) => {
+                    warn!("{} subscription reminders not delivered: {}", channel.name(), error.reason);
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// One alert for any number of nodes: a list in the message, the names in
 /// `node`. `None` when there is nothing to say.
 fn batch(event: &'static str, mark: &str, what: &str, items: Vec<(&str, String)>) -> Option<Note> {

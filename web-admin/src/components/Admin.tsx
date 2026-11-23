@@ -1,4 +1,4 @@
-import { Activity, ArrowUpCircle, Bell, CircleDollarSign, Database, Palette, Radio, Server, Settings, Shield } from "lucide-react"
+import { Activity, ArrowUpCircle, Bell, CalendarClock, CircleDollarSign, Database, Palette, Radio, Server, Settings, Shield } from "lucide-react"
 import { useEffect, useRef } from "react"
 
 import { behind, type Node, outdatedAgents } from "@/lib/api"
@@ -10,6 +10,7 @@ import { Notify } from "@/pages/Notify"
 import { Ping } from "@/pages/Ping"
 import { Security } from "@/pages/Security"
 import { SettingsTab } from "@/pages/Settings"
+import { Subscriptions } from "@/pages/Subscriptions"
 import { Themes } from "@/pages/Themes"
 import { Update, useVersions } from "@/pages/Update"
 
@@ -21,6 +22,7 @@ const ADMIN_SECTIONS = [
   { path: "/admin/ping", label: "延迟", icon: Radio },
   { path: "/admin/notify", label: "通知", icon: Bell },
   { path: "/admin/load", label: "负载", icon: Activity },
+  { path: "/admin/subscriptions", label: "订阅", icon: CalendarClock },
   { path: "/admin/data", label: "数据", icon: Database },
   { path: "/admin/themes", label: "主题", icon: Palette },
   { path: "/admin/security", label: "安全", icon: Shield },
@@ -98,6 +100,8 @@ export function Admin({
           <Notify nodes={nodes} refresh={refresh} />
         ) : path === "/admin/load" ? (
           <LoadNotification nodes={nodes} />
+        ) : path === "/admin/subscriptions" ? (
+          <Subscriptions />
         ) : path === "/admin/data" ? (
           <Data />
         ) : path === "/admin/themes" ? (

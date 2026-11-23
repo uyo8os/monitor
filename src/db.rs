@@ -285,7 +285,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -573,13 +573,16 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 14 {
         migrate_to_14(&tx)?;
     }
+    if from < 15 {
+        tx.execute_batch(crate::subscription::SCHEMA)?;
+    }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
     Ok(())
 }
 
 /// Every table this build keeps.
-const TABLES: [&str; 13] = [
+const TABLES: [&str; 16] = [
     "load_rule",
     "load_rule_node",
     "load_alert_state",
@@ -593,12 +596,22 @@ const TABLES: [&str; 13] = [
     "session",
     "metric_hour",
     "ping_hour",
+    "subscription",
+    "subscription_renewal",
+    "subscription_reminder",
 ];
 
-/// The tables `migrate_to_11` adds. A backup taken before it lacks them and is
-/// still a backup this build restores.
-const MIGRATED_TABLES: [&str; 5] =
-    ["metric_hour", "ping_hour", "load_rule", "load_rule_node", "load_alert_state"];
+/// Older backups can acquire these tables through migrations.
+const MIGRATED_TABLES: [&str; 8] = [
+    "metric_hour",
+    "ping_hour",
+    "load_rule",
+    "load_rule_node",
+    "load_alert_state",
+    "subscription",
+    "subscription_renewal",
+    "subscription_reminder",
+];
 
 /// One node's stored configuration and last known facts.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -1239,6 +1252,9 @@ impl Db {
             .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table'", [], |r| r.get::<_, i64>(0))?
             == 0;
         conn.execute_batch(SCHEMA)?;
+        if fresh {
+            conn.execute_batch(crate::subscription::SCHEMA)?;
+        }
         restrict(path);
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -1256,7 +1272,7 @@ impl Db {
         Ok(Self { reader, conn: Mutex::new(conn) })
     }
 
-    fn conn(&self) -> MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
         lock(&self.conn)
     }
 
@@ -3345,8 +3361,8 @@ impl Db {
         if plotted > 0 {
             refuse!("文件里有视图或触发器，不是 hub 导出的备份");
         }
-        // The hourly tables are created by the migration below; their columns are
-        // compared with the rest once it has run.
+        // Older backups can acquire these tables in the migration below. Compare
+        // their columns with the rest once it has run.
         for table in TABLES.iter().filter(|t| !MIGRATED_TABLES.contains(t)) {
             let found: i64 = candidate.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -3390,6 +3406,7 @@ impl Db {
         // `CREATE TABLE`. Extra columns are ignored.
         let reference = Connection::open_in_memory()?;
         reference.execute_batch(SCHEMA)?;
+        reference.execute_batch(crate::subscription::SCHEMA)?;
         migrate(&reference, SCHEMA_VERSION)?;
         for table in TABLES {
             let want = columns_of(&reference, table)?;
@@ -3539,7 +3556,7 @@ fn close_bucket(out: &mut Vec<serde_json::Value>, open: &mut Vec<(i64, Tally)>, 
 /// return times, an editor opened before the delete -- would pass to the new
 /// row. The high mark lives in `setting`, so a backup carries it; without one,
 /// as after an upgrade, the table's own highest id stands in.
-fn next_id(tx: &rusqlite::Transaction<'_>, table: &str) -> Result<i64> {
+pub(crate) fn next_id(tx: &rusqlite::Transaction<'_>, table: &str) -> Result<i64> {
     let id = issued(tx, table)? + 1;
     put_setting(tx, &format!("{table}_id_issued"), &id.to_string())?;
     Ok(id)
@@ -3558,7 +3575,7 @@ fn issued(conn: &Connection, table: &str) -> Result<i64> {
 }
 
 /// The tables whose ids [`next_id`] issues.
-pub(crate) const ID_TABLES: [&str; 3] = ["node", "ping_task", "load_rule"];
+pub(crate) const ID_TABLES: [&str; 4] = ["node", "ping_task", "load_rule", "subscription"];
 
 fn setting(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(conn.query_row("SELECT value FROM setting WHERE key = ?1", [key], |r| r.get(0)).optional()?)
@@ -3948,6 +3965,7 @@ mod tests {
         let _ = std::fs::remove_file(&bad);
         let newer = Connection::open(&bad).unwrap();
         newer.execute_batch(SCHEMA).unwrap();
+        newer.execute_batch(crate::subscription::SCHEMA).unwrap();
         newer.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1)).unwrap();
         refused("from a newer hub");
 

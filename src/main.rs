@@ -31,6 +31,7 @@ mod db;
 mod frontend;
 mod load_notification;
 mod notify;
+mod subscription;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -634,6 +635,7 @@ async fn main() -> Result<()> {
     tokio::spawn(housekeeping(app.clone()));
     tokio::spawn(notify::deliver(app.clone(), inbox));
     tokio::spawn(notify::watch(app.clone()));
+    tokio::spawn(notify::watch_subscriptions(app.clone()));
     app.load_notifications.start(app.clone());
 
     let listener = match tokio::net::TcpListener::bind(args.listen).await {
@@ -691,6 +693,13 @@ fn router(app: Shared) -> Router {
         .route("/api/cost/fx/refresh", post(api::refresh_fx))
         .route("/api/version", get(api::versions))
         .route("/api/notify/test", post(notify::test))
+        .route("/api/subscriptions", get(subscription::list).post(subscription::create))
+        .route("/api/subscriptions/{id}", put(subscription::edit))
+        .route("/api/subscriptions/{id}/history", get(subscription::history))
+        .route("/api/subscriptions/batch", post(subscription::batch))
+        .route("/api/subscriptions/order", put(subscription::order))
+        .route("/api/subscriptions/renew/preview", post(subscription::preview))
+        .route("/api/subscriptions/renew", post(subscription::renew))
         .route(
             "/api/notification/load/rules",
             get(api::load_notification_rules).post(api::create_load_notification_rule),
@@ -1294,6 +1303,58 @@ mod tests {
         assert_eq!(request(&routes, "DELETE", &path, Value::Null).await.0, StatusCode::OK);
         let (_, listed) = request(&routes, "GET", "/api/notification/load/rules", Value::Null).await;
         assert_eq!(listed["rules"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn subscription_preview_commit_and_history_use_the_admin_routes() {
+        use serde_json::{json, Value};
+        use tower::ServiceExt;
+
+        let app = Arc::new(App::for_test(Db::open(":memory:").unwrap()));
+        app.db.create_session(&auth::sha256("subscription-test"), Utc::now().timestamp() + 3_600).unwrap();
+        let routes = router(app);
+        let call = |method: &str, path: &str, body: Value, signed_in: bool| {
+            let routes = routes.clone();
+            let mut builder = axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("sec-fetch-site", "same-origin")
+                .extension(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
+            if signed_in {
+                builder = builder.header(header::COOKIE, "monitor_session=subscription-test");
+            }
+            let request = builder.body(axum::body::Body::from(body.to_string())).unwrap();
+            async move {
+                let response = routes.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+            }
+        };
+
+        assert_eq!(call("GET", "/api/subscriptions", Value::Null, false).await.0, StatusCode::UNAUTHORIZED);
+        let plan = json!({
+            "name":"Cloud", "category":"软件", "kind":"recurring", "due_on":"2027-01-31",
+            "cycle":{"unit":"months","count":1}, "anchor_day":null, "month_end":false, "purchased_on":null,
+            "amount":"8.95", "currency":"USD", "enabled":true, "reminder_days":[7,3,0],
+            "overdue_reminder":false, "notes":"",
+        });
+        let (status, created) = call("POST", "/api/subscriptions", plan, true).await;
+        assert_eq!(status, StatusCode::OK);
+        let id = created["id"].as_i64().unwrap();
+        let renewal = json!({"paid_on":"2026-01-10","periods":2,"items":[{"id":id,"revision":1}]});
+        let (status, preview) = call("POST", "/api/subscriptions/renew/preview", renewal.clone(), true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(preview["items"][0]["next_due"], "2027-03-31");
+        assert_eq!(preview["items"][0]["amount"], "17.90");
+        let (_, list) = call("GET", "/api/subscriptions", Value::Null, true).await;
+        assert_eq!(list["items"][0]["due_on"], "2027-01-31");
+        assert_eq!(call("POST", "/api/subscriptions/renew", renewal.clone(), true).await.0, StatusCode::OK);
+        assert_eq!(call("POST", "/api/subscriptions/renew", renewal, true).await.0, StatusCode::BAD_REQUEST);
+        let (_, history) = call("GET", &format!("/api/subscriptions/{id}/history"), Value::Null, true).await;
+        assert_eq!(history["history"].as_array().unwrap().len(), 1);
+        assert_eq!(history["history"][0]["next_due"], "2027-03-31");
     }
 
     fn app(site: &str) -> App {
