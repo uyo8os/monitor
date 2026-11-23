@@ -8,7 +8,7 @@ on:
       version:
         description: "Stable version tag (vX.Y.Z)"
         required: true
-        default: "v1.5.4"
+        default: "v1.5.5"
         type: string
 
 concurrency:
